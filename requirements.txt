@@ -1,39 +1,14 @@
-# -----------------------------
-# Core Framework
-# -----------------------------
-fastapi==0.110.0
-uvicorn[standard]==0.29.0
+fastapi
+uvicorn[standard]
 
-# -----------------------------
-# Database (SQLAlchemy + Postgres)
-# -----------------------------
-sqlalchemy==2.0.29
-psycopg2-binary==2.9.9
+sqlalchemy
+psycopg2-binary
 
-# -----------------------------
-# Authentication & Security
-# -----------------------------
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-bcrypt==4.0.1
-python-multipart==0.0.9
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
 
-# -----------------------------
-# Async & Utilities
-# -----------------------------
-pydantic==2.6.4
-pydantic-settings==2.2.1
+pydantic
+python-dotenv
 
-# -----------------------------
-# AI / ML (for Fraud Agent)
-# -----------------------------
-scikit-learn==1.4.2
-numpy==1.26.4
-
-# -----------------------------
-# Optional (Development / Logging)
-# -----------------------------
-loguru==0.7.2
-
-#fix requirements during deployment
 
