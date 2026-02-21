@@ -13,7 +13,7 @@ import os
 import argparse
 import logging
 from pathlib import Path
-from datetime import date
+from datetime import date, timedelta
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,6 +25,8 @@ from app.config import settings
 from app.transcriber import transcribe_file, is_transcriber_ready
 from app.llm import get_llm_client
 from app.jira_client import get_jira_client, find_closest_team_member
+from app.db import get_db_session
+from app.models import Task, Member
 
 # Configure logging
 logging.basicConfig(
@@ -150,6 +152,42 @@ def test_jira_creation(tasks: list, dry_run: bool = False) -> list:
             if result.get('key'):
                 print(f"  ✅ Created: {result['key']}")
                 print(f"     URL: {result.get('url', 'N/A')}")
+                
+                # Store task in database
+                try:
+                    with get_db_session() as db:
+                        # Find member by name
+                        member = None
+                        if matched_assignee:
+                            member = db.query(Member).filter(
+                                Member.member_name.ilike(f"%{matched_assignee}%")
+                            ).first()
+                        
+                        if member:
+                            # Parse deadline
+                            due_date_str = task.get('due_date')
+                            if due_date_str and due_date_str not in ['null', 'None', None]:
+                                try:
+                                    deadline = date.fromisoformat(due_date_str)
+                                except ValueError:
+                                    deadline = date.today() + timedelta(days=7)
+                            else:
+                                deadline = date.today() + timedelta(days=7)
+                            
+                            # Create Task record
+                            db_task = Task(
+                                member_id=member.member_id,
+                                description=f"{task.get('title', 'Task')} [Jira: {result['key']}]",
+                                deadline=deadline
+                            )
+                            db.add(db_task)
+                            db.commit()
+                            print(f"     📊 Stored in DB: task_id={db_task.task_id}, member={member.member_name}")
+                        else:
+                            print(f"     ⚠️  Not stored in DB (no matching member)")
+                except Exception as db_err:
+                    print(f"     ⚠️  DB storage failed: {db_err}")
+                
                 created_tickets.append(result)
             else:
                 print(f"  ❌ Failed to create ticket")
