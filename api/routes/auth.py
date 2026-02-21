@@ -21,15 +21,16 @@ def get_db():
 @router.post("/signup")
 def signup(user: UserCreate, db: Session = Depends(get_db)):
     try:
-        existing_user = db.query(User).filter(User.username == user.username).first()
+        existing_user = db.query(User).filter(User.member_name == user.username).first()
         if existing_user:
             raise HTTPException(status_code=400, detail="User already exists")
 
         hashed_pwd = hash_password(user.password)
         
         new_user = User(
-            username=user.username,
-            hashed_password=hashed_pwd
+            member_name=user.username,
+            designation=user.designation,
+            password=hashed_pwd
         )
         db.add(new_user)
         db.commit()
@@ -48,16 +49,17 @@ def login(
     db: Session = Depends(get_db)
 ):
     try:
-        user = db.query(User).filter(User.username == form.username).first()
+        user = db.query(User).filter(User.member_name == form.username).first()
 
-        if not user or not verify_password(form.password, str(user.hashed_password)):
+        if not user or not verify_password(form.password, str(user.password)):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
-        token = create_access_token({"sub": user.username})
+        token = create_access_token({"sub": user.member_name})
         return {
             "access_token": token,
             "token_type": "bearer",
-            "email": user.username
+            "member_name": user.member_name,
+            "designation": user.designation
         }
     except HTTPException:
         raise
@@ -76,11 +78,12 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     if not username:
         raise HTTPException(status_code=401, detail="Invalid token")
     
-    user = db.query(User).filter(User.username == username).first()
+    user = db.query(User).filter(User.member_name == username).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     
     return {
-        "username": user.username,
-        "email": user.username
+        "member_id": user.member_id,
+        "member_name": user.member_name,
+        "designation": user.designation
     }
