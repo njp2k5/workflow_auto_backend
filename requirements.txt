@@ -1,20 +1,43 @@
-fastapi
-uvicorn[standard]
+# FastAPI and web server
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
 
-sqlalchemy
-psycopg2-binary
+# Database
+sqlalchemy>=2.0.25
+psycopg2-binary>=2.9.9
+alembic>=1.13.1
 
+# Authentication (existing)
 python-jose[cryptography]
 passlib[bcrypt]
-python-multipart
-
-pydantic
-python-dotenv
-pydantic_settings
-
 passlib==1.7.4
 bcrypt==3.2.2
 
+# Audio/Video Transcription
+faster-whisper>=0.10.0
+
+# Jira API
+atlassian-python-api>=3.41.10
+requests>=2.31.0
+
+# LLM and LangGraph
+langchain>=0.1.6
+langchain-groq>=0.0.1
+langgraph>=0.0.26
+groq>=0.4.2
+
+# Configuration
+pydantic>=2.6.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.1
+
+# Async scheduling
+apscheduler>=3.10.4
+
+# Utilities
+httpx>=0.26.0
+tenacity>=8.2.3
 email-validator
 
 
