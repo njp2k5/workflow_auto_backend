@@ -204,6 +204,10 @@ def api_progress_report(since_days: int = Query(7, ge=1, le=365)):
         repo_info = gh.get_repo_info()
         prs = gh.get_recent_pull_requests(state="all", per_page=10)
         report = llm_summary.generate_progress_report(commits, contributors, repo_info, prs)
+        # Add frontend-expected top-level fields
+        report["period"] = f"Last {since_days} days"
+        report["total_commits"] = len(commits)
+        report["contributors"] = len(contributors)
         return report
     except Exception as exc:
         logger.exception("Error generating progress report")
