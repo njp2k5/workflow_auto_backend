@@ -1,15 +1,38 @@
 """
-REST API Bridge – Exposes the MCP server's data over standard HTTP endpoints
-so the React frontend can consume it directly without needing an MCP client.
+GitHub MCP Server - Combined MCP (SSE transport) + REST API
 
-Run standalone:
-    uvicorn github_mcp_server.api:app --port 3003 --reload
+MCP Protocol endpoints (for any MCP client):
+    GET  /mcp/sse        - SSE connection endpoint
+    POST /mcp/messages   - MCP message handler
+
+REST API endpoints (for React frontend):
+    GET /health
+    GET /api/commits
+    GET /api/commits/{sha}
+    GET /api/commits/{sha}/summary
+    GET /api/commits-summary
+    GET /api/progress-report
+    GET /api/contributors
+    GET /api/repo-info
+    GET /api/commit-activity
+    GET /api/pull-requests
+    GET /api/branches
+
+Live SSE stream (for React EventSource):
+    GET /api/stream/dashboard
 """
+import asyncio
+import json
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.routing import Route, Mount
+from starlette.responses import StreamingResponse
+from mcp.server.sse import SseServerTransport
 
 from . import github_client as gh
 from . import summarizer as llm_summary
@@ -17,38 +40,106 @@ from .config import settings
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# MCP SSE Transport
+# ---------------------------------------------------------------------------
+_sse_transport = SseServerTransport("/mcp/messages")
+
+
+async def _handle_mcp_sse(request: Request):
+    """Accept an MCP client connection over SSE."""
+    from .server import mcp as mcp_instance
+
+    async with _sse_transport.connect_sse(
+        request.scope, request.receive, request._send
+    ) as (read_stream, write_stream):
+        await mcp_instance._mcp_server.run(
+            read_stream,
+            write_stream,
+            mcp_instance._mcp_server.create_initialization_options(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# FastAPI App
+# ---------------------------------------------------------------------------
 app = FastAPI(
-    title="GitHub MCP – REST Bridge",
-    description="HTTP API that mirrors the GitHub MCP server tools for the React frontend.",
+    title="GitHub MCP Server",
+    description="MCP server (SSE transport) + REST API for GitHub commit tracking dashboard",
     version="1.0.0",
 )
 
-# CORS – allow the React frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Mount MCP protocol endpoints inside the same app
+app.router.routes.insert(0, Route("/mcp/sse", endpoint=_handle_mcp_sse))
+app.mount("/mcp/messages", app=_sse_transport.handle_post_message)
 
-# ── Health ─────────────────────────────────────────────────────────────────
 
-
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {
         "status": "ok",
         "service": "github-mcp-server",
+        "mcp_sse_endpoint": "/mcp/sse",
         "github_configured": bool(settings.github_token),
         "llm_configured": bool(settings.groq_api_key),
     }
 
 
-# ── Commits ────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# SSE Dashboard Stream (React connects via EventSource)
+# ---------------------------------------------------------------------------
+@app.get("/api/stream/dashboard")
+async def stream_dashboard():
+    """
+    Server-Sent Events stream for the React dashboard.
+    Pushes fresh GitHub stats every 30 seconds automatically.
+
+    React usage:
+        const es = new EventSource('http://localhost:3003/api/stream/dashboard');
+        es.onmessage = (e) => setDashboard(JSON.parse(e.data));
+    """
+    async def _generate():
+        while True:
+            try:
+                data = await asyncio.to_thread(_build_dashboard)
+                yield f"data: {json.dumps(data)}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            await asyncio.sleep(30)
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
+def _build_dashboard() -> dict:
+    """Collect all dashboard data (runs in a thread)."""
+    return {
+        "commits": gh.get_recent_commits(since_days=7, per_page=10),
+        "contributors": gh.get_contributors(),
+        "repo_info": gh.get_repo_info(),
+        "branches": gh.get_branches(),
+        "pull_requests": gh.get_recent_pull_requests(state="all", per_page=5),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# REST Endpoints (for React)
+# ---------------------------------------------------------------------------
 @app.get("/api/commits")
 def api_commits(
     branch: Optional[str] = Query(None, description="Branch name"),
@@ -69,7 +160,7 @@ def api_commit_detail(sha: str):
     try:
         return gh.get_commit_detail(sha)
     except Exception as exc:
-        logger.exception(f"Error fetching commit {sha}")
+        logger.exception("Error fetching commit %s", sha)
         raise HTTPException(status_code=502, detail=str(exc))
 
 
@@ -81,11 +172,8 @@ def api_commit_summary(sha: str):
         summary = llm_summary.summarize_commit_detail(detail)
         return {"sha": sha, "summary": summary}
     except Exception as exc:
-        logger.exception(f"Error summarizing commit {sha}")
+        logger.exception("Error summarizing commit %s", sha)
         raise HTTPException(status_code=502, detail=str(exc))
-
-
-# ── Commit Summary ────────────────────────────────────────────────────────
 
 
 @app.get("/api/commits-summary")
@@ -107,9 +195,6 @@ def api_commits_summary(
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-# ── Progress Report ───────────────────────────────────────────────────────
-
-
 @app.get("/api/progress-report")
 def api_progress_report(since_days: int = Query(7, ge=1, le=365)):
     """Full LLM-powered progress report for the frontend dashboard."""
@@ -125,9 +210,6 @@ def api_progress_report(since_days: int = Query(7, ge=1, le=365)):
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-# ── Contributors ──────────────────────────────────────────────────────────
-
-
 @app.get("/api/contributors")
 def api_contributors():
     """Fetch repository contributors."""
@@ -136,9 +218,6 @@ def api_contributors():
     except Exception as exc:
         logger.exception("Error fetching contributors")
         raise HTTPException(status_code=502, detail=str(exc))
-
-
-# ── Repo Info ─────────────────────────────────────────────────────────────
 
 
 @app.get("/api/repo-info")
@@ -151,9 +230,6 @@ def api_repo_info():
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-# ── Commit Activity ──────────────────────────────────────────────────────
-
-
 @app.get("/api/commit-activity")
 def api_commit_activity():
     """Weekly commit activity for the past year."""
@@ -162,9 +238,6 @@ def api_commit_activity():
     except Exception as exc:
         logger.exception("Error fetching commit activity")
         raise HTTPException(status_code=502, detail=str(exc))
-
-
-# ── Pull Requests ─────────────────────────────────────────────────────────
 
 
 @app.get("/api/pull-requests")
@@ -178,9 +251,6 @@ def api_pull_requests(
     except Exception as exc:
         logger.exception("Error fetching pull requests")
         raise HTTPException(status_code=502, detail=str(exc))
-
-
-# ── Branches ──────────────────────────────────────────────────────────────
 
 
 @app.get("/api/branches")
