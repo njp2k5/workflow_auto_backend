@@ -1,0 +1,12 @@
+# GitHub MCP Server – additional dependencies
+# Install alongside the main project requirements
+mcp[cli]>=1.0.0
+httpx>=0.26.0
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+pydantic>=2.6.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.1
+langchain>=0.1.6
+langchain-groq>=0.0.1
+groq>=0.4.2

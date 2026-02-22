@@ -2,7 +2,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -41,6 +41,16 @@ from app.transcriber import transcribe_file, is_transcriber_ready
 from app.jira_client import get_jira_client
 from app.llm import get_llm_client
 from app.pipeline import process_meeting, process_recording
+
+# GitHub MCP Server integration
+try:
+    from github_mcp_server import github_client as gh
+    from github_mcp_server import summarizer as llm_summary
+    GITHUB_MCP_AVAILABLE = True
+except ImportError:
+    GITHUB_MCP_AVAILABLE = False
+    gh = None  # type: ignore
+    llm_summary = None  # type: ignore
 
 # Configure logging
 logging.basicConfig(
@@ -107,6 +117,50 @@ class RecordingFileInfo(BaseModel):
     size_mb: float
     modified_at: str
     processed: bool
+
+
+class GitHubProgressReport(BaseModel):
+    summary: str
+    highlights: List[str]
+    risks: List[str]
+    contributor_summary: str
+    velocity: str
+    raw_data: dict
+
+
+class GitHubCommit(BaseModel):
+    sha: str
+    message: str
+    author: str
+    date: str
+    url: str
+
+
+class GitHubCommitDetail(BaseModel):
+    sha: str
+    message: str
+    author: str
+    date: str
+    stats: dict
+    files_changed: List[dict]
+    url: str
+
+
+class GitHubContributor(BaseModel):
+    login: str
+    contributions: int
+    avatar_url: str
+    profile_url: str
+
+
+class GitHubRepoInfo(BaseModel):
+    name: str
+    description: str
+    language: str
+    stars: int
+    forks: int
+    open_issues: int
+    url: str
 
 
 @asynccontextmanager
@@ -401,6 +455,166 @@ def create_app() -> FastAPI:
         db.commit()
         
         return {"message": f"Meeting {meeting_id} deleted"}
+
+    # ==========================================================
+    # GitHub MCP Server - Commit Status & Progress Tracking
+    # ==========================================================
+
+    @app.get("/api/github/health", tags=["GitHub Commit Tracking"])
+    async def github_health():
+        """Check GitHub MCP server configuration status."""
+        if not GITHUB_MCP_AVAILABLE:
+            return {
+                "status": "unavailable",
+                "message": "GitHub MCP server not installed",
+                "github_configured": False,
+                "llm_configured": False,
+            }
+        from github_mcp_server.config import settings as gh_settings
+        return {
+            "status": "ok",
+            "service": "github-mcp-server",
+            "github_configured": bool(gh_settings.github_token),
+            "llm_configured": bool(gh_settings.groq_api_key),
+            "repo": f"{gh_settings.github_owner}/{gh_settings.github_repo}",
+        }
+
+    @app.get("/api/github/commits", tags=["GitHub Commit Tracking"], response_model=List[GitHubCommit])
+    async def get_github_commits(
+        branch: Optional[str] = Query(None, description="Branch name"),
+        since_days: int = Query(7, ge=1, le=365, description="Days to look back"),
+        per_page: int = Query(30, ge=1, le=100, description="Max commits"),
+    ):
+        """Fetch recent commits from GitHub repository."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_recent_commits(branch=branch, since_days=since_days, per_page=per_page)
+        except Exception as exc:
+            logger.exception("Error fetching GitHub commits")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/commits/{sha}", tags=["GitHub Commit Tracking"], response_model=GitHubCommitDetail)
+    async def get_github_commit_detail(sha: str):
+        """Get detailed info for a single commit including file changes."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_commit_detail(sha)
+        except Exception as exc:
+            logger.exception(f"Error fetching commit {sha}")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/commits/{sha}/summary", tags=["GitHub Commit Tracking"])
+    async def get_github_commit_summary(sha: str):
+        """Get an LLM-generated summary of a single commit."""
+        if not GITHUB_MCP_AVAILABLE or gh is None or llm_summary is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            detail = gh.get_commit_detail(sha)
+            summary = llm_summary.summarize_commit_detail(detail)
+            return {
+                "sha": sha,
+                "summary": summary,
+            }
+        except Exception as exc:
+            logger.exception(f"Error summarizing commit {sha}")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/commits-summary", tags=["GitHub Commit Tracking"])
+    async def get_github_commits_summary(
+        branch: Optional[str] = Query(None),
+        since_days: int = Query(7, ge=1, le=365),
+    ):
+        """LLM-generated summary of recent commits (progress summary)."""
+        if not GITHUB_MCP_AVAILABLE or gh is None or llm_summary is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            commits = gh.get_recent_commits(branch=branch, since_days=since_days)
+            summary = llm_summary.summarize_commits(commits)
+            return {
+                "total_commits": len(commits),
+                "since_days": since_days,
+                "branch": branch or "default",
+                "summary": summary,
+            }
+        except Exception as exc:
+            logger.exception("Error generating GitHub commit summary")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/progress-report", tags=["GitHub Commit Tracking"], response_model=GitHubProgressReport)
+    async def get_github_progress_report(since_days: int = Query(7, ge=1, le=365)):
+        """Full LLM-powered progress report for the dashboard (commits + contributors + PRs)."""
+        if not GITHUB_MCP_AVAILABLE or gh is None or llm_summary is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            commits = gh.get_recent_commits(since_days=since_days)
+            contributors = gh.get_contributors()
+            repo_info = gh.get_repo_info()
+            prs = gh.get_recent_pull_requests(state="all", per_page=10)
+            report = llm_summary.generate_progress_report(commits, contributors, repo_info, prs)
+            return report
+        except Exception as exc:
+            logger.exception("Error generating GitHub progress report")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/contributors", tags=["GitHub Commit Tracking"], response_model=List[GitHubContributor])
+    async def get_github_contributors():
+        """Fetch repository contributors with commit counts."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_contributors()
+        except Exception as exc:
+            logger.exception("Error fetching GitHub contributors")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/repo-info", tags=["GitHub Commit Tracking"], response_model=GitHubRepoInfo)
+    async def get_github_repo_info():
+        """Fetch basic repository metadata (stars, language, etc.)."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_repo_info()
+        except Exception as exc:
+            logger.exception("Error fetching GitHub repo info")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/commit-activity", tags=["GitHub Commit Tracking"])
+    async def get_github_commit_activity():
+        """Weekly commit activity for the past year (for charts)."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_commit_activity()
+        except Exception as exc:
+            logger.exception("Error fetching GitHub commit activity")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/pull-requests", tags=["GitHub Commit Tracking"])
+    async def get_github_pull_requests(
+        state: str = Query("all", pattern="^(open|closed|all)$"),
+        per_page: int = Query(10, ge=1, le=100),
+    ):
+        """Fetch recent pull requests."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_recent_pull_requests(state=state, per_page=per_page)
+        except Exception as exc:
+            logger.exception("Error fetching GitHub pull requests")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/branches", tags=["GitHub Commit Tracking"])
+    async def get_github_branches():
+        """List repository branches."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_branches()
+        except Exception as exc:
+            logger.exception("Error fetching GitHub branches")
+            raise HTTPException(status_code=502, detail=str(exc))
 
     return app
 
