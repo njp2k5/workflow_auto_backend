@@ -9,7 +9,7 @@ Database Schema:
 - meetings: meeting_id, meeting_date, transcription_id (FK)
 - tasks: task_id, member_id (FK), description, deadline
 """
-import logging
+import time
 from typing import TypedDict, List, Dict, Any, Optional
 from datetime import datetime, date
 
@@ -17,10 +17,20 @@ from langgraph.graph import StateGraph, END
 
 from app.llm import get_llm_client
 from app.jira_client import get_jira_client
+from app.confluence_client import get_confluence_client, build_meeting_page_html
 from app.db import get_db_session
 from app.models import Meeting, Transcription, Task, Member, ProcessingLog
+from app.config import settings
+from app.logger import (
+    get_logger,
+    log_node_entry,
+    log_node_exit,
+    log_pipeline_start,
+    log_pipeline_end,
+    log_step_progress,
+)
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class MeetingState(TypedDict):
@@ -31,17 +41,27 @@ class MeetingState(TypedDict):
     filename: Optional[str]
     file_path: Optional[str]
     
+    # Extracted metadata
+    meeting_title: Optional[str]  # LLM-extracted meeting title
+    project_name: Optional[str]   # Extracted project/product name
+    
     # Processed data
     summary: Optional[str]
     tasks: List[Dict[str, Any]]
     jira_keys: List[str]
+    skipped_tasks: List[Dict[str, Any]]  # Tasks skipped due to duplicates
+    
+    # Confluence data
+    confluence_page_id: Optional[str]
+    confluence_url: Optional[str]
     
     # Database IDs (set after store_results)
     transcription_id: Optional[int]
     meeting_id: Optional[int]
     task_ids: List[int]
     
-    # Processing status
+    # Processing decisions and status
+    decisions: List[str]  # Log of decisions made during processing
     error: Optional[str]
     current_step: str
 
@@ -69,12 +89,17 @@ def log_processing_step(
 
 def summarize_meeting(state: MeetingState) -> MeetingState:
     """
-    Node: Summarize the meeting transcript using LLM.
+    Node: Summarize the meeting transcript and extract title/project using LLM.
+    Also extracts meeting title and project name for smart page management.
     """
-    logger.info("Summarizing meeting transcript")
-    state["current_step"] = "summarize_meeting"
+    node_name = "summarize_meeting"
+    start_time = time.time()
+    log_node_entry(node_name, logger)
+    log_step_progress(1, 5, "Summarize Meeting", logger)
     
-    log_processing_step(state.get("meeting_id"), "summarize_meeting", "started")
+    state["current_step"] = node_name
+    state["decisions"] = state.get("decisions", [])
+    log_processing_step(state.get("meeting_id"), node_name, "started")
     
     try:
         llm_client = get_llm_client()
@@ -82,23 +107,48 @@ def summarize_meeting(state: MeetingState) -> MeetingState:
         if not llm_client.is_configured:
             raise RuntimeError("LLM client not configured")
         
+        # Extract meeting title
+        logger.info("Extracting meeting title from transcript...")
+        meeting_title = llm_client.extract_meeting_title(state["transcript"])
+        state["meeting_title"] = meeting_title
+        state["decisions"].append(f"Meeting title: '{meeting_title}'")
+        logger.info(f"📌 Meeting Title: {meeting_title}")
+        
+        # Generate summary
+        logger.info("Generating meeting summary...")
         summary = llm_client.summarize_meeting(state["transcript"])
         state["summary"] = summary
         
+        # Extract project name for smart Confluence page management
+        logger.info("Identifying project/product name...")
+        project_name = llm_client.extract_project_name(state["transcript"], summary)
+        state["project_name"] = project_name
+        
+        if project_name:
+            state["decisions"].append(f"Project identified: '{project_name}'")
+            logger.info(f"📁 Project: {project_name}")
+        else:
+            state["decisions"].append("No specific project identified - will create new meeting page")
+            logger.info("No specific project identified in transcript")
+        
         log_processing_step(
             state.get("meeting_id"),
-            "summarize_meeting",
+            node_name,
             "completed",
-            message=f"Summary length: {len(summary)}"
+            message=f"Title: {meeting_title}, Summary: {len(summary)} chars"
         )
         
         logger.info(f"Generated summary ({len(summary)} chars)")
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=True, duration_ms=duration_ms)
         
     except Exception as e:
         error_msg = f"Failed to summarize meeting: {str(e)}"
         logger.error(error_msg)
         state["error"] = error_msg
-        log_processing_step(state.get("meeting_id"), "summarize_meeting", "failed", message=error_msg)
+        log_processing_step(state.get("meeting_id"), node_name, "failed", message=error_msg)
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=False, duration_ms=duration_ms)
     
     return state
 
@@ -107,13 +157,18 @@ def extract_tasks(state: MeetingState) -> MeetingState:
     """
     Node: Extract action items from the transcript using LLM.
     """
+    node_name = "extract_tasks"
+    
     if state.get("error"):
+        logger.warning(f"Skipping {node_name} due to previous error")
         return state
     
-    logger.info("Extracting tasks from transcript")
-    state["current_step"] = "extract_tasks"
+    start_time = time.time()
+    log_node_entry(node_name, logger)
+    log_step_progress(2, 5, "Extract Tasks", logger)
     
-    log_processing_step(state.get("meeting_id"), "extract_tasks", "started")
+    state["current_step"] = node_name
+    log_processing_step(state.get("meeting_id"), node_name, "started")
     
     try:
         llm_client = get_llm_client()
@@ -121,6 +176,7 @@ def extract_tasks(state: MeetingState) -> MeetingState:
         if not llm_client.is_configured:
             raise RuntimeError("LLM client not configured")
         
+        logger.info("Calling LLM to extract action items...")
         summary = state.get("summary", "")
         tasks_result = llm_client.extract_tasks(state["transcript"], summary)
         tasks = tasks_result.get("tasks", [])
@@ -128,18 +184,25 @@ def extract_tasks(state: MeetingState) -> MeetingState:
         
         log_processing_step(
             state.get("meeting_id"),
-            "extract_tasks",
+            node_name,
             "completed",
             message=f"Extracted {len(tasks)} tasks"
         )
         
         logger.info(f"Extracted {len(tasks)} tasks")
+        for i, task in enumerate(tasks, 1):
+            logger.info(f"  Task {i}: {task.get('title', 'Untitled')[:50]}...")
+            
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=True, duration_ms=duration_ms)
         
     except Exception as e:
         error_msg = f"Failed to extract tasks: {str(e)}"
         logger.error(error_msg)
         state["error"] = error_msg
-        log_processing_step(state.get("meeting_id"), "extract_tasks", "failed", message=error_msg)
+        log_processing_step(state.get("meeting_id"), node_name, "failed", message=error_msg)
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=False, duration_ms=duration_ms)
     
     return state
 
@@ -147,22 +210,36 @@ def extract_tasks(state: MeetingState) -> MeetingState:
 def create_jira_issues(state: MeetingState) -> MeetingState:
     """
     Node: Create Jira issues for extracted tasks.
+    Checks for duplicate tickets before creating new ones.
     """
+    node_name = "create_jira_issues"
+    
     if state.get("error"):
+        logger.warning(f"Skipping {node_name} due to previous error")
         return state
+    
+    start_time = time.time()
+    log_node_entry(node_name, logger)
+    log_step_progress(3, 5, "Create Jira Issues", logger)
+    
+    state["decisions"] = state.get("decisions", [])
+    state["skipped_tasks"] = state.get("skipped_tasks", [])
     
     tasks = state.get("tasks", [])
     if not tasks:
         logger.info("No tasks to create Jira issues for")
         state["jira_keys"] = []
+        state["decisions"].append("No tasks extracted - skipping Jira issue creation")
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=True, duration_ms=duration_ms)
         return state
     
-    logger.info(f"Creating Jira issues for {len(tasks)} tasks")
-    state["current_step"] = "create_jira_issues"
-    
-    log_processing_step(state.get("meeting_id"), "create_jira_issues", "started")
+    logger.info(f"Processing {len(tasks)} tasks for Jira issue creation")
+    state["current_step"] = node_name
+    log_processing_step(state.get("meeting_id"), node_name, "started")
     
     jira_keys = []
+    skipped_tasks = []
     
     try:
         jira_client = get_jira_client()
@@ -170,25 +247,48 @@ def create_jira_issues(state: MeetingState) -> MeetingState:
         if not jira_client.is_configured:
             logger.warning("Jira client not configured, skipping issue creation")
             state["jira_keys"] = []
+            state["decisions"].append("Jira not configured - tickets not created")
             log_processing_step(
                 state.get("meeting_id"),
-                "create_jira_issues",
+                node_name,
                 "skipped",
                 message="Jira not configured"
             )
+            duration_ms = (time.time() - start_time) * 1000
+            log_node_exit(node_name, logger, success=True, duration_ms=duration_ms)
             return state
         
-        for task in tasks:
+        for i, task in enumerate(tasks, 1):
             try:
                 title = task.get("title", "Untitled Task")
                 description = task.get("description", "")
                 assignee = task.get("assignee")
                 priority = task.get("priority", "Medium")
                 
-                full_description = f"{description}\n\n---\nExtracted from meeting recording"
-                if state.get("filename"):
-                    full_description += f"\nSource: {state['filename']}"
+                # Check for duplicate ticket
+                logger.info(f"[Task {i}/{len(tasks)}] Checking for duplicates: '{title[:50]}...'")
+                existing_key = jira_client.check_for_duplicate(title, assignee)
                 
+                if existing_key:
+                    # Duplicate found - skip creation
+                    decision = f"SKIPPED task '{title[:40]}...' - similar ticket exists: {existing_key}"
+                    state["decisions"].append(decision)
+                    logger.warning(f"⚠️  {decision}")
+                    skipped_tasks.append({
+                        **task,
+                        "skipped_reason": f"Duplicate of {existing_key}",
+                        "existing_key": existing_key
+                    })
+                    continue
+                
+                # No duplicate found - create new issue
+                full_description = f"{description}\n\n---\nExtracted from meeting recording"
+                if state.get("meeting_title"):
+                    full_description += f"\nMeeting: {state['meeting_title']}"
+                if state.get("filename"):
+                    full_description += f"\nSource file: {state['filename']}"
+                
+                logger.info(f"[Task {i}/{len(tasks)}] Creating new Jira issue...")
                 issue_key = jira_client.create_issue(
                     summary=title,
                     description=full_description,
@@ -199,30 +299,197 @@ def create_jira_issues(state: MeetingState) -> MeetingState:
                 
                 if issue_key:
                     jira_keys.append(issue_key)
-                    logger.info(f"Created Jira issue: {issue_key}")
+                    decision = f"CREATED Jira issue {issue_key}: '{title[:40]}...'"
+                    state["decisions"].append(decision)
+                    logger.info(f"✅ {decision}")
                     
             except Exception as e:
                 logger.error(f"Failed to create Jira issue for task '{task.get('title')}': {e}")
         
         state["jira_keys"] = jira_keys
+        state["skipped_tasks"] = skipped_tasks
+        
+        # Summary log
+        logger.info(f"═══ Jira Summary: {len(jira_keys)} created, {len(skipped_tasks)} skipped (duplicates) ═══")
         
         log_processing_step(
             state.get("meeting_id"),
-            "create_jira_issues",
+            node_name,
             "completed",
-            message=f"Created {len(jira_keys)} issues"
+            message=f"Created {len(jira_keys)} issues, skipped {len(skipped_tasks)} duplicates"
         )
+        
+        logger.info(f"Successfully created {len(jira_keys)} Jira issues")
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=True, duration_ms=duration_ms)
         
     except Exception as e:
         error_msg = f"Failed in Jira issue creation: {str(e)}"
         logger.error(error_msg)
         state["jira_keys"] = jira_keys
+        state["skipped_tasks"] = skipped_tasks
         log_processing_step(
             state.get("meeting_id"),
-            "create_jira_issues",
+            node_name,
             "failed",
             message=error_msg
         )
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=False, duration_ms=duration_ms)
+    
+    return state
+
+
+def update_confluence_page(state: MeetingState) -> MeetingState:
+    """
+    Node: Create or update Confluence page with meeting notes.
+    Uses project name to find and update existing project pages.
+    Runs after Jira issues are created so we can include Jira links.
+    """
+    node_name = "update_confluence_page"
+    start_time = time.time()
+    log_node_entry(node_name, logger)
+    log_step_progress(4, 5, "Update Confluence Page", logger)
+    
+    state["current_step"] = node_name
+    state["decisions"] = state.get("decisions", [])
+    log_processing_step(state.get("meeting_id"), node_name, "started")
+    
+    try:
+        confluence_client = get_confluence_client()
+        
+        if not confluence_client.is_configured:
+            logger.warning("Confluence client not configured, skipping page creation")
+            state["decisions"].append("Confluence not configured - page not created")
+            log_processing_step(
+                state.get("meeting_id"),
+                node_name,
+                "skipped",
+                message="Confluence not configured"
+            )
+            duration_ms = (time.time() - start_time) * 1000
+            log_node_exit(node_name, logger, success=True, duration_ms=duration_ms)
+            return state
+        
+        logger.info("Building Confluence page content...")
+        
+        # Use extracted meeting title or build from filename
+        meeting_date = state.get("meeting_date", date.today().isoformat())
+        meeting_title = state.get("meeting_title")
+        project_name = state.get("project_name")
+        filename = state.get("filename", "Meeting")
+        
+        # Build page title based on whether we have a project
+        if meeting_title:
+            title = f"{meeting_title} - {meeting_date}"
+        else:
+            title = f"Meeting Notes - {filename.split('.')[0] if filename else 'Meeting'} - {meeting_date}"
+        
+        logger.info(f"📄 Page title: {title}")
+        
+        # Prepare action items with Jira links
+        action_items = []
+        tasks = state.get("tasks", [])
+        jira_keys = state.get("jira_keys", [])
+        skipped_tasks = state.get("skipped_tasks", [])
+        
+        # Include created tasks with Jira links
+        jira_key_idx = 0
+        for task in tasks:
+            # Check if this task was skipped
+            skipped_info = next((s for s in skipped_tasks if s.get("title") == task.get("title")), None)
+            
+            item = {
+                "description": task.get("title") or task.get("description", "Task"),
+                "assignee": task.get("assignee", "Unassigned")
+            }
+            
+            if skipped_info:
+                # Task was skipped - show existing ticket
+                item["jira_key"] = skipped_info.get("existing_key")
+                item["status"] = "existing"
+            elif jira_key_idx < len(jira_keys):
+                # New ticket created
+                item["jira_key"] = jira_keys[jira_key_idx]
+                item["status"] = "new"
+                jira_key_idx += 1
+            
+            action_items.append(item)
+        
+        # Extract key points and decisions from summary
+        summary = state.get("summary", "No summary available.")
+        key_points = []
+        decisions_list = []
+        
+        if summary:
+            lines = summary.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line.startswith('- ') or line.startswith('* '):
+                    key_points.append(line[2:])
+        
+        # Build HTML content
+        html = build_meeting_page_html(
+            title=title,
+            meeting_date=meeting_date,
+            summary=summary or "No summary available.",
+            key_points=key_points if key_points else None,
+            decisions=decisions_list if decisions_list else None,
+            action_items=action_items if action_items else None,
+            transcript=state.get("transcript"),
+            jira_base_url=settings.jira_server
+        )
+        
+        # Use project-aware page creation if project name is available
+        if project_name:
+            logger.info(f"📁 Looking for existing project page: {project_name}")
+            result = confluence_client.create_or_update_project_page(project_name, title, html)
+        else:
+            logger.info("No project identified - creating standard meeting page")
+            result = confluence_client.create_or_update_page(title, html)
+        
+        action = "processed"
+        if result:
+            state["confluence_page_id"] = result.get("page_id")
+            state["confluence_url"] = result.get("page_url")
+            action = result.get("action", "created")
+            
+            # Log the decision
+            decision = result.get("decision", f"Page {action}")
+            state["decisions"].append(decision)
+            
+            # Log decision details
+            decision_log = result.get("decision_log", [])
+            for log_item in decision_log:
+                logger.info(f"  💡 {log_item}")
+            
+            logger.info(f"Confluence page {action}: {result.get('page_url')}")
+        else:
+            logger.warning("Confluence returned no result")
+            state["decisions"].append("Confluence page creation failed")
+        
+        log_processing_step(
+            state.get("meeting_id"),
+            node_name,
+            "completed",
+            message=f"Page {action}: {state.get('confluence_url')}"
+        )
+        
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=True, duration_ms=duration_ms)
+        
+    except Exception as e:
+        error_msg = f"Failed to create/update Confluence page: {str(e)}"
+        logger.error(error_msg)
+        # Don't set error state - Confluence failure should not halt pipeline
+        log_processing_step(
+            state.get("meeting_id"),
+            node_name,
+            "failed",
+            message=error_msg
+        )
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=False, duration_ms=duration_ms)
     
     return state
 
@@ -232,10 +499,13 @@ def store_results(state: MeetingState) -> MeetingState:
     Node: Store processing results in the database.
     Creates Transcription, Meeting, and Task records according to schema.
     """
-    logger.info("Storing results in database")
-    state["current_step"] = "store_results"
+    node_name = "store_results"
+    start_time = time.time()
+    log_node_entry(node_name, logger)
+    log_step_progress(5, 5, "Store Results", logger)
     
-    log_processing_step(state.get("meeting_id"), "store_results", "started")
+    state["current_step"] = node_name
+    log_processing_step(state.get("meeting_id"), node_name, "started")
     
     try:
         with get_db_session() as db:
@@ -260,10 +530,12 @@ def store_results(state: MeetingState) -> MeetingState:
             else:
                 meeting_date_val = date.today()
             
-            # 3. Create Meeting record linked to transcription
+            # 3. Create Meeting record linked to transcription (with Confluence info)
             meeting = Meeting(
                 meeting_date=meeting_date_val,
-                transcription_id=transcription.transcription_id
+                transcription_id=transcription.transcription_id,
+                confluence_page_id=state.get("confluence_page_id"),
+                confluence_url=state.get("confluence_url")
             )
             db.add(meeting)
             db.flush()  # Get meeting_id
@@ -323,13 +595,17 @@ def store_results(state: MeetingState) -> MeetingState:
             
             logger.info(f"Stored: meeting_id={meeting.meeting_id}, transcription_id={transcription.transcription_id}, tasks={len(task_ids)}")
         
-        log_processing_step(state["meeting_id"], "store_results", "completed")  # type: ignore[arg-type]
+        log_processing_step(state["meeting_id"], node_name, "completed")  # type: ignore[arg-type]
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=True, duration_ms=duration_ms)
         
     except Exception as e:
         error_msg = f"Failed to store results: {str(e)}"
         logger.error(error_msg)
         state["error"] = error_msg
-        log_processing_step(state.get("meeting_id"), "store_results", "failed", message=error_msg)
+        log_processing_step(state.get("meeting_id"), node_name, "failed", message=error_msg)
+        duration_ms = (time.time() - start_time) * 1000
+        log_node_exit(node_name, logger, success=False, duration_ms=duration_ms)
     
     return state
 
@@ -349,7 +625,8 @@ def create_pipeline():
     1. summarize_meeting - Generate meeting summary
     2. extract_tasks - Extract action items
     3. create_jira_issues - Create Jira issues for tasks
-    4. store_results - Store in database (transcription, meeting, tasks)
+    4. update_confluence_page - Create/update Confluence meeting notes
+    5. store_results - Store in database (transcription, meeting, tasks, confluence)
     """
     workflow = StateGraph(MeetingState)
     
@@ -357,6 +634,7 @@ def create_pipeline():
     workflow.add_node("summarize_meeting", summarize_meeting)
     workflow.add_node("extract_tasks", extract_tasks)
     workflow.add_node("create_jira_issues", create_jira_issues)
+    workflow.add_node("update_confluence_page", update_confluence_page)
     workflow.add_node("store_results", store_results)
     
     # Define flow
@@ -377,9 +655,11 @@ def create_pipeline():
     workflow.add_conditional_edges(
         "create_jira_issues",
         should_continue,
-        {"continue": "store_results", "end": "store_results"}
+        {"continue": "update_confluence_page", "end": "store_results"}
     )
     
+    # Confluence node always proceeds to store_results
+    workflow.add_edge("update_confluence_page", "store_results")
     workflow.add_edge("store_results", END)
     
     return workflow.compile()
@@ -422,19 +702,31 @@ def process_meeting(
         - task_ids: List of created task IDs
         - error: Error message if any
     """
-    logger.info(f"Starting pipeline processing for: {filename or 'meeting'}")
+    pipeline_start_time = time.time()
+    
+    log_pipeline_start("Meeting Processing", logger, context={
+        "filename": filename or "meeting",
+        "meeting_date": meeting_date or date.today().isoformat(),
+        "transcript_length": f"{len(transcript)} chars"
+    })
     
     initial_state: MeetingState = {
         "meeting_date": meeting_date or date.today().isoformat(),
         "transcript": transcript,
         "filename": filename,
         "file_path": file_path,
+        "meeting_title": None,
+        "project_name": None,
         "summary": None,
         "tasks": [],
         "jira_keys": [],
+        "skipped_tasks": [],
+        "confluence_page_id": None,
+        "confluence_url": None,
         "transcription_id": None,
         "meeting_id": None,
         "task_ids": [],
+        "decisions": [],
         "error": None,
         "current_step": "initialized"
     }
@@ -443,10 +735,35 @@ def process_meeting(
         pipeline = get_pipeline()
         result = pipeline.invoke(initial_state)
         
+        duration_ms = (time.time() - pipeline_start_time) * 1000
+        success = result.get("error") is None
+        
+        log_pipeline_end("Meeting Processing", logger, success=success, duration_ms=duration_ms, results={
+            "meeting_id": result.get("meeting_id"),
+            "meeting_title": result.get("meeting_title", "N/A"),
+            "tasks_extracted": len(result.get("tasks", [])),
+            "jira_issues": len(result.get("jira_keys", [])),
+            "skipped_duplicates": len(result.get("skipped_tasks", [])),
+            "confluence_url": result.get("confluence_url", "N/A")
+        })
+        
+        # Log decisions made
+        decisions = result.get("decisions", [])
+        if decisions:
+            logger.info("═══ Decisions Made During Processing ═══")
+            for decision in decisions:
+                logger.info(f"  ▸ {decision}")
+        
         return dict(result)
         
     except Exception as e:
+        duration_ms = (time.time() - pipeline_start_time) * 1000
         logger.error(f"Pipeline execution failed: {e}")
+        
+        log_pipeline_end("Meeting Processing", logger, success=False, duration_ms=duration_ms, results={
+            "error": str(e)
+        })
+        
         return {
             **initial_state,
             "error": str(e)

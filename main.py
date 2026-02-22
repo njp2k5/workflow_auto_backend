@@ -1,4 +1,3 @@
-import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from typing import List, Optional
@@ -10,7 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 print("imported contents for main")
-from api.routes import auth, health
+from api.routes import auth, health, srs
 print("imported routes")
 from db.base import Base
 print("imported base")
@@ -43,6 +42,7 @@ from app.transcriber import transcribe_file, is_transcriber_ready
 from app.jira_client import get_jira_client
 from app.llm import get_llm_client
 from app.pipeline import process_meeting, process_recording
+from app.logger import setup_logging, get_logger
 
 # GitHub MCP Server integration
 try:
@@ -60,6 +60,9 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+# Configure logging with custom formatter
+setup_logging(level=settings.log_level, use_colors=True)
+logger = get_logger(__name__)
 
 
 # Pydantic models for API responses
@@ -257,6 +260,7 @@ def create_app() -> FastAPI:
     # Include existing routers
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(srs.router)  # SRS document processing
     
     # ==========================================================
     # Recording Processing Endpoints

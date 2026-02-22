@@ -2,7 +2,6 @@
 Audio/Video transcription using Faster-Whisper.
 Supports mp4, mp3, wav, m4a files.
 """
-import logging
 import os
 from typing import Optional
 from pathlib import Path
@@ -16,8 +15,9 @@ except ImportError:
     WHISPER_AVAILABLE = False
 
 from app.config import settings
+from app.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Global model instance (loaded once)
 _whisper_model: Optional["WhisperModel"] = None  # type: ignore

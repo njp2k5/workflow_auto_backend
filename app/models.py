@@ -81,6 +81,17 @@ class Meeting(Base):
         ForeignKey("transcription.transcription_id"), 
         nullable=False
     )
+    # Confluence integration
+    confluence_page_id = Column(
+        String(50),
+        nullable=True,
+        comment="Confluence page ID for meeting notes"
+    )
+    confluence_url = Column(
+        String(500),
+        nullable=True,
+        comment="URL to Confluence meeting page"
+    )
     
     # Relationship to transcription
     transcription = relationship("Transcription", back_populates="meetings")
@@ -100,6 +111,8 @@ class Meeting(Base):
             "meeting_date": meeting_date_val.isoformat() if meeting_date_val else None,
             "transcription_id": self.transcription_id,
             "transcription_summary": self.transcription.transcription_summary if self.transcription else None,
+            "confluence_page_id": self.confluence_page_id,
+            "confluence_url": self.confluence_url,
         }
 
 

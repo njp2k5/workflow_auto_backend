@@ -154,13 +154,34 @@ LOG_LEVEL=INFO
 3. Note your Atlassian email and token
 4. Ensure your Jira project exists with the specified key
 
-### 5. Get Groq API Key
+### 5. Set Up Confluence Integration
+
+1. Use the same Atlassian account as Jira (shared API token)
+2. Create a Confluence space for meeting notes or use existing one
+3. Note the **Space Key** (visible in space URL)
+4. Add Confluence configuration to `.env`:
+
+```env
+# Confluence Configuration
+CONFLUENCE_BASE_URL=https://your-domain.atlassian.net
+CONFLUENCE_EMAIL=your-email@example.com
+CONFLUENCE_API_TOKEN=your-api-token  # Same as Jira token
+CONFLUENCE_SPACE_KEY=MEET
+```
+
+The Confluence integration will automatically:
+- Create a new page for each processed meeting
+- Update existing pages if a meeting with the same title/date exists
+- Include meeting summary, key points, and action items with Jira links
+- Store the full transcript in a collapsible section
+
+### 6. Get Groq API Key
 
 1. Sign up at [Groq Console](https://console.groq.com)
 2. Create an API key
 3. Add it to your `.env` file
 
-### 6. Initialize Database
+### 7. Initialize Database
 
 ```bash
 # Create PostgreSQL database
@@ -169,7 +190,7 @@ createdb meet_processor
 # Tables are created automatically on startup
 ```
 
-### 7. Run the Application
+### 8. Run the Application
 
 ```bash
 # Development
@@ -254,12 +275,13 @@ curl -X POST http://localhost:8000/api/meet/process \
 
 ## LangGraph Pipeline
 
-The processing pipeline consists of four nodes:
+The processing pipeline consists of five nodes:
 
 1. **summarize_meeting**: Generates a concise summary using LLM
 2. **extract_tasks**: Extracts action items with assignees and due dates
 3. **create_jira_issues**: Creates Jira tickets for each task
-4. **store_results**: Persists all data to PostgreSQL
+4. **update_confluence_page**: Creates/updates Confluence page with meeting notes
+5. **store_results**: Persists all data to PostgreSQL
 
 ```
 ┌─────────────────┐     ┌─────────────────┐
@@ -272,6 +294,12 @@ The processing pipeline consists of four nodes:
          │              ┌─────────────────┐
          │              │  create_jira    │
          │              │    issues       │
+         │              └────────┬────────┘
+         │                       │
+         │                       v
+         │              ┌─────────────────┐
+         │              │   update        │
+         │              │   confluence    │
          │              └────────┬────────┘
          │                       │
          v                       v
@@ -316,6 +344,10 @@ The LLM extracts tasks in this format:
 | JIRA_PROJECT_KEY | Yes | PROJ | Project key for issues |
 | GROQ_API_KEY | Yes | - | Groq API key |
 | GROQ_MODEL | No | llama-3.1-8b-instant | LLM model to use |
+| CONFLUENCE_BASE_URL | No | - | Confluence Cloud server URL |
+| CONFLUENCE_EMAIL | No | - | Confluence account email |
+| CONFLUENCE_API_TOKEN | No | - | Confluence API token (same as Jira) |
+| CONFLUENCE_SPACE_KEY | No | MEET | Space key for meeting pages |
 | MEET_POLL_INTERVAL | No | 60 | Polling interval (seconds) |
 | APP_ENV | No | development | Environment (development/production/test) |
 | DEBUG | No | true | Enable debug mode |
@@ -350,6 +382,13 @@ docker run -d \
 - Verify API token is valid
 - Check project key exists
 - Ensure email matches Atlassian account
+
+### Confluence Connection Issues
+
+- Verify API token is valid (same as Jira)
+- Check space key exists and is accessible
+- Ensure email matches Atlassian account
+- If pages aren't creating, check space permissions
 
 ### LLM Issues
 

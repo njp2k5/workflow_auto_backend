@@ -2,7 +2,6 @@
 Scheduler for periodic recording folder polling.
 Detects new recording files and triggers the transcription + processing pipeline.
 """
-import logging
 import asyncio
 from datetime import datetime
 from typing import Optional, Set
@@ -16,8 +15,9 @@ from app.recording_watcher import (
     clear_processed_cache as clear_watcher_cache,
     get_recordings_status
 )
+from app.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Scheduler instance
 _scheduler: Optional[AsyncIOScheduler] = None
