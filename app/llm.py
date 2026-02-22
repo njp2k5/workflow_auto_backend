@@ -117,11 +117,22 @@ class LLMClient:
         if not self.is_configured:
             raise RuntimeError("LLM client not configured")
         
-        system_prompt = """Extract tasks from the transcript. Return JSON only.
-Format: {"tasks": [{"title": "task", "assignee": "name or Unassigned", "due_date": "YYYY-MM-DD or null"}]}
-If no tasks, return: {"tasks": []}"""
+        system_prompt = """You are a JSON extraction assistant. Your ONLY job is to extract tasks and return valid JSON.
 
-        user_prompt = f"""Transcript:\n{transcript}\n\nJSON:"""
+RULES:
+1. Output ONLY valid JSON - no explanations, no markdown, no text before or after
+2. Every response must start with { and end with }
+3. Use this exact format: {"tasks": [{"title": "task description", "assignee": "person name", "due_date": "YYYY-MM-DD"}]}
+4. If no clear assignee, use "Unassigned"
+5. If no due date mentioned, use null
+6. If no tasks found, return: {"tasks": []}
+7. Look for action words like: will, should, needs to, assigned to, responsible for"""
+
+        user_prompt = f"""Extract all tasks/action items from this transcript and return ONLY JSON:
+
+{transcript}
+
+Respond with JSON only:"""
 
         try:
             messages = [
@@ -134,8 +145,15 @@ If no tasks, return: {"tasks": []}"""
             response_text = content if isinstance(content, str) else str(content)
             response_text = response_text.strip()
             
+            # Log raw response for debugging
+            logger.debug(f"Raw LLM response: {response_text[:500]}")
+            
             # Parse JSON from response
             tasks_data = self._parse_json_response(response_text)
+            
+            # If still empty, try regex extraction from transcript
+            if not tasks_data.get("tasks") and transcript:
+                tasks_data = self._extract_tasks_fallback(transcript)
             
             # Validate structure
             if "tasks" not in tasks_data:
@@ -169,6 +187,11 @@ If no tasks, return: {"tasks": []}"""
         Returns:
             Parsed JSON dictionary
         """
+        # Handle empty or whitespace-only response
+        if not response_text or not response_text.strip():
+            logger.warning("LLM returned empty response, defaulting to empty tasks")
+            return {"tasks": []}
+        
         # Remove markdown code blocks if present
         cleaned_text = response_text
         
@@ -183,6 +206,11 @@ If no tasks, return: {"tasks": []}"""
         
         cleaned_text = cleaned_text.strip()
         
+        # Handle empty after cleanup
+        if not cleaned_text:
+            logger.warning("LLM response empty after cleanup, defaulting to empty tasks")
+            return {"tasks": []}
+        
         try:
             return json.loads(cleaned_text)
         except json.JSONDecodeError as e:
@@ -196,6 +224,51 @@ If no tasks, return: {"tasks": []}"""
                 except json.JSONDecodeError:
                     pass
             return {"tasks": []}
+    
+    def _extract_tasks_fallback(self, transcript: str) -> Dict[str, Any]:
+        """
+        Fallback task extraction using regex patterns when LLM returns non-JSON.
+        
+        Args:
+            transcript: Meeting transcript text
+            
+        Returns:
+            Dictionary with extracted tasks
+        """
+        import re
+        
+        tasks = []
+        
+        # Patterns that indicate task assignment
+        patterns = [
+            # "X will do Y" or "X should do Y"
+            r"(\b[A-Z][a-z]+(?:\s+[A-Z]\.?)?)\s+(?:will|should|needs?\s+to|is\s+going\s+to)\s+(.+?)(?:\.|$)",
+            # "assigned to X" or "X is assigned"
+            r"(.+?)\s+(?:is\s+)?assigned\s+to\s+(\b[A-Z][a-z]+(?:\s+[A-Z]\.?)?)",
+            # "X to start/begin/work on Y"
+            r"(\b[A-Z][a-z]+(?:\s+[A-Z]\.?)?)\s+to\s+(?:start|begin|work\s+on|handle)\s+(.+?)(?:\.|$)",
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, transcript, re.IGNORECASE)
+            for match in matches:
+                if len(match) == 2:
+                    assignee, task_desc = match[0].strip(), match[1].strip()
+                    # Swap if pattern matched in reverse order
+                    if "assigned to" in pattern:
+                        task_desc, assignee = assignee, task_desc
+                    
+                    if task_desc and len(task_desc) > 5:  # Skip very short matches
+                        tasks.append({
+                            "title": task_desc[:200],
+                            "assignee": assignee,
+                            "due_date": None
+                        })
+        
+        if tasks:
+            logger.info(f"Fallback extraction found {len(tasks)} tasks")
+        
+        return {"tasks": tasks}
     
     def analyze_meeting(self, transcript: str) -> Dict[str, Any]:
         """

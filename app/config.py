@@ -54,6 +54,18 @@ class Settings(BaseSettings):
     groq_api_key: str = Field(default="")
     groq_model: str = Field(default="llama-3.1-8b-instant")
     
+    # Confluence Configuration
+    confluence_base_url: str = Field(
+        default="https://your-domain.atlassian.net",
+        description="Confluence Cloud base URL"
+    )
+    confluence_email: str = Field(default="")
+    confluence_api_token: str = Field(default="")
+    confluence_space_key: str = Field(
+        default="MEET",
+        description="Confluence space key for meeting pages"
+    )
+    
     # Polling Configuration
     recordings_poll_interval: int = Field(
         default=30,

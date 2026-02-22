@@ -17,8 +17,10 @@ from langgraph.graph import StateGraph, END
 
 from app.llm import get_llm_client
 from app.jira_client import get_jira_client
+from app.confluence_client import get_confluence_client, build_meeting_page_html
 from app.db import get_db_session
 from app.models import Meeting, Transcription, Task, Member, ProcessingLog
+from app.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,10 @@ class MeetingState(TypedDict):
     summary: Optional[str]
     tasks: List[Dict[str, Any]]
     jira_keys: List[str]
+    
+    # Confluence data
+    confluence_page_id: Optional[str]
+    confluence_url: Optional[str]
     
     # Database IDs (set after store_results)
     transcription_id: Optional[int]
@@ -227,6 +233,104 @@ def create_jira_issues(state: MeetingState) -> MeetingState:
     return state
 
 
+def update_confluence_page(state: MeetingState) -> MeetingState:
+    """
+    Node: Create or update Confluence page with meeting notes.
+    Runs after Jira issues are created so we can include Jira links.
+    """
+    logger.info("Creating/updating Confluence page")
+    state["current_step"] = "update_confluence_page"
+    
+    log_processing_step(state.get("meeting_id"), "update_confluence_page", "started")
+    
+    try:
+        confluence_client = get_confluence_client()
+        
+        if not confluence_client.is_configured:
+            logger.warning("Confluence client not configured, skipping page creation")
+            log_processing_step(
+                state.get("meeting_id"),
+                "update_confluence_page",
+                "skipped",
+                message="Confluence not configured"
+            )
+            return state
+        
+        # Build page title
+        meeting_date = state.get("meeting_date", date.today().isoformat())
+        filename = state.get("filename", "Meeting")
+        title = f"Meeting Notes - {filename.split('.')[0] if filename else 'Meeting'} - {meeting_date}"
+        
+        # Prepare action items with Jira links
+        action_items = []
+        tasks = state.get("tasks", [])
+        jira_keys = state.get("jira_keys", [])
+        
+        for i, task in enumerate(tasks):
+            item = {
+                "description": task.get("title") or task.get("description", "Task"),
+                "assignee": task.get("assignee", "Unassigned")
+            }
+            # Match Jira key if available
+            if i < len(jira_keys):
+                item["jira_key"] = jira_keys[i]
+            action_items.append(item)
+        
+        # Extract key points and decisions from summary
+        summary = state.get("summary", "No summary available.")
+        key_points = []
+        decisions = []
+        
+        # Simple extraction from summary (LLM could enhance this)
+        if summary:
+            lines = summary.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line.startswith('- ') or line.startswith('* '):
+                    key_points.append(line[2:])
+        
+        # Build HTML content
+        html = build_meeting_page_html(
+            title=title,
+            meeting_date=meeting_date,
+            summary=summary or "No summary available.",
+            key_points=key_points if key_points else None,
+            decisions=decisions if decisions else None,
+            action_items=action_items if action_items else None,
+            transcript=state.get("transcript"),
+            jira_base_url=settings.jira_server
+        )
+        
+        # Create or update page
+        result = confluence_client.create_or_update_page(title, html)
+        
+        state["confluence_page_id"] = result.get("page_id")
+        state["confluence_url"] = result.get("page_url")
+        
+        action = result.get("action", "created")
+        logger.info(f"Confluence page {action}: {result.get('page_url')}")
+        
+        log_processing_step(
+            state.get("meeting_id"),
+            "update_confluence_page",
+            "completed",
+            message=f"Page {action}: {state.get('confluence_url')}"
+        )
+        
+    except Exception as e:
+        error_msg = f"Failed to create/update Confluence page: {str(e)}"
+        logger.error(error_msg)
+        # Don't set error state - Confluence failure should not halt pipeline
+        log_processing_step(
+            state.get("meeting_id"),
+            "update_confluence_page",
+            "failed",
+            message=error_msg
+        )
+    
+    return state
+
+
 def store_results(state: MeetingState) -> MeetingState:
     """
     Node: Store processing results in the database.
@@ -260,10 +364,12 @@ def store_results(state: MeetingState) -> MeetingState:
             else:
                 meeting_date_val = date.today()
             
-            # 3. Create Meeting record linked to transcription
+            # 3. Create Meeting record linked to transcription (with Confluence info)
             meeting = Meeting(
                 meeting_date=meeting_date_val,
-                transcription_id=transcription.transcription_id
+                transcription_id=transcription.transcription_id,
+                confluence_page_id=state.get("confluence_page_id"),
+                confluence_url=state.get("confluence_url")
             )
             db.add(meeting)
             db.flush()  # Get meeting_id
@@ -349,7 +455,8 @@ def create_pipeline():
     1. summarize_meeting - Generate meeting summary
     2. extract_tasks - Extract action items
     3. create_jira_issues - Create Jira issues for tasks
-    4. store_results - Store in database (transcription, meeting, tasks)
+    4. update_confluence_page - Create/update Confluence meeting notes
+    5. store_results - Store in database (transcription, meeting, tasks, confluence)
     """
     workflow = StateGraph(MeetingState)
     
@@ -357,6 +464,7 @@ def create_pipeline():
     workflow.add_node("summarize_meeting", summarize_meeting)
     workflow.add_node("extract_tasks", extract_tasks)
     workflow.add_node("create_jira_issues", create_jira_issues)
+    workflow.add_node("update_confluence_page", update_confluence_page)
     workflow.add_node("store_results", store_results)
     
     # Define flow
@@ -377,9 +485,11 @@ def create_pipeline():
     workflow.add_conditional_edges(
         "create_jira_issues",
         should_continue,
-        {"continue": "store_results", "end": "store_results"}
+        {"continue": "update_confluence_page", "end": "store_results"}
     )
     
+    # Confluence node always proceeds to store_results
+    workflow.add_edge("update_confluence_page", "store_results")
     workflow.add_edge("store_results", END)
     
     return workflow.compile()
@@ -432,6 +542,8 @@ def process_meeting(
         "summary": None,
         "tasks": [],
         "jira_keys": [],
+        "confluence_page_id": None,
+        "confluence_url": None,
         "transcription_id": None,
         "meeting_id": None,
         "task_ids": [],

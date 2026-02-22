@@ -1,22 +1,26 @@
 """
 Recording folder watcher and processor.
 Detects new recording files and triggers the transcription + processing pipeline.
-Includes full workflow: Transcription → LLM Task Extraction → Jira Ticket Creation → DB Storage
+Includes full workflow: Transcription → LLM Task Extraction → Jira Ticket Creation → Confluence → DB Storage
 """
 import logging
 import os
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional, Set, List, Dict, Any
-from threading import Thread
+from threading import Thread, Lock
 import time
 
 from app.config import settings
 from app.transcriber import transcribe_file, is_transcriber_ready
 from app.llm import get_llm_client
-from app.jira_client import get_jira_client, find_closest_team_member
+from app.jira_client import get_jira_client
+from app.confluence_client import get_confluence_client, build_simple_meeting_page
 from app.db import get_db_session
 from app.models import Task, Member, Transcription, Meeting
+from app.date_utils import parse_due_date, format_date_iso, get_default_deadline
+from app.member_matching import get_member_name, match_member_name
+from app.task_extractor import safe_extract_tasks, validate_and_normalize_task
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +30,16 @@ SUPPORTED_EXTENSIONS = {'.mp4', '.mp3', '.wav', '.m4a', '.mpeg', '.webm', '.mkv'
 # Track processed files in memory to avoid duplicates within a session
 _processed_files: Set[str] = set()
 
+# Track files currently being processed to prevent concurrent processing
+_currently_processing: Set[str] = set()
+
 # Watcher thread reference
 _watcher_thread: Optional[Thread] = None
 _watcher_running: bool = False
+
+# Processing lock to prevent scheduler overlap
+_processing_lock = Lock()
+_is_processing: bool = False
 
 
 def get_recordings_dir() -> Path:
@@ -125,7 +136,7 @@ def scan_for_new_recordings() -> List[Path]:
 def process_recording_file(file_path: Path) -> Dict[str, Any]:
     """
     Process a single recording file through the full pipeline:
-    Transcription → LLM Task Extraction → Jira Ticket Creation → DB Storage
+    Transcription → LLM Task Extraction → Jira Ticket Creation → Confluence → DB Storage
     
     Args:
         file_path: Path to the recording file
@@ -134,6 +145,19 @@ def process_recording_file(file_path: Path) -> Dict[str, Any]:
         Processing result dictionary
     """
     filename = file_path.name
+    
+    # Prevent duplicate concurrent processing
+    if filename in _currently_processing:
+        logger.info(f"⏭️ Skipping already-processing file: {filename}")
+        return {
+            "filename": filename,
+            "error": "Already being processed",
+            "processed": False
+        }
+    
+    # Add to processing set
+    _currently_processing.add(filename)
+    
     logger.info(f"🎬 Processing recording: {filename}")
     
     result = {
@@ -143,143 +167,239 @@ def process_recording_file(file_path: Path) -> Dict[str, Any]:
         "tasks": [],
         "jira_tickets": [],
         "db_tasks": [],
+        "confluence_page_id": None,
+        "confluence_url": None,
+        "meeting_id": None,
         "error": None,
         "processed": False
     }
     
     try:
+        meeting_date_str = date.today().isoformat()
+        summary = None
+        tasks = []
+        transcript = None
+        
         # Step 1: Transcribe the recording
-        logger.info(f"📝 Step 1: Transcribing {filename}...")
-        
-        if not is_transcriber_ready():
-            raise RuntimeError("Transcriber not available (faster-whisper not installed)")
-        
-        transcript = transcribe_file(str(file_path))
-        
-        if not transcript:
-            raise ValueError("Transcription returned empty result")
-        
-        result["transcript"] = transcript
-        logger.info(f"✅ Transcription complete: {len(transcript)} characters")
-        
-        # Step 2: Extract tasks using LLM
-        logger.info(f"🤖 Step 2: Extracting tasks via LLM...")
-        
-        llm = get_llm_client()
-        if not llm.is_configured:
-            logger.warning("LLM not configured, skipping task extraction")
-            result["error"] = "LLM not configured"
+        try:
+            logger.info(f"📝 Step 1: Transcribing {filename}...")
+            
+            if not is_transcriber_ready():
+                raise RuntimeError("Transcriber not available (faster-whisper not installed)")
+            
+            transcript = transcribe_file(str(file_path))
+            
+            if not transcript:
+                raise ValueError("Transcription returned empty result")
+            
+            result["transcript"] = transcript
+            logger.info(f"✅ Transcription complete: {len(transcript)} characters")
+            
+        except Exception as e:
+            logger.error(f"❌ Transcription error: {e}")
+            result["error"] = f"Transcription failed: {e}"
+            _processed_files.add(filename)  # Mark as processed to avoid retry loop
             return result
         
-        # Get summary
-        summary = llm.summarize_meeting(transcript)
-        result["summary"] = summary
-        logger.info(f"📋 Summary: {summary[:100]}...")
-        
-        # Extract tasks
-        tasks_result = llm.extract_tasks(transcript, summary)
-        tasks = tasks_result.get("tasks", [])
-        result["tasks"] = tasks
-        logger.info(f"📋 Extracted {len(tasks)} task(s)")
-        
-        # Step 3: Create Jira tickets and store in DB
-        logger.info(f"🎫 Step 3: Creating Jira tickets and storing in DB...")
-        
-        jira = get_jira_client()
-        
-        for task in tasks:
-            task_title = task.get("title", "Untitled Task")
-            raw_assignee = task.get("assignee")
-            due_date_str = task.get("due_date")
-            
-            # Map assignee to closest team member
-            matched_assignee = find_closest_team_member(raw_assignee) if raw_assignee else None
-            
-            if matched_assignee:
-                logger.info(f"👤 Mapped '{raw_assignee}' -> '{matched_assignee}'")
-            
-            # Create Jira ticket
-            jira_key = None
-            if jira.is_configured:
-                try:
-                    description = f"Task extracted from meeting recording: {filename}\n\nAssignee mentioned: {raw_assignee or 'Unassigned'}"
-                    
-                    jira_result = jira.create_issue(
-                        summary=task_title,
-                        description=description,
-                        issue_type="Task",
-                        assignee_name=matched_assignee,
-                        due_date=due_date_str if due_date_str not in ['null', 'None', None] else None
-                    )
-                    
-                    jira_key = jira_result.get("key")
-                    if jira_key:
-                        logger.info(f"✅ Created Jira ticket: {jira_key}")
-                        result["jira_tickets"].append(jira_key)
-                except Exception as jira_err:
-                    logger.error(f"❌ Jira error: {jira_err}")
-            else:
-                logger.warning("Jira not configured, skipping ticket creation")
-            
-            # Store task in database
-            try:
-                with get_db_session() as db:
-                    # Find member by name
-                    member = None
-                    if matched_assignee:
-                        member = db.query(Member).filter(
-                            Member.member_name.ilike(f"%{matched_assignee}%")
-                        ).first()
-                    
-                    if member:
-                        # Parse deadline
-                        if due_date_str and due_date_str not in ['null', 'None', None]:
-                            try:
-                                deadline = date.fromisoformat(due_date_str)
-                            except ValueError:
-                                deadline = date.today() + timedelta(days=7)
-                        else:
-                            deadline = date.today() + timedelta(days=7)
-                        
-                        # Create Task record
-                        task_desc = f"{task_title}"
-                        if jira_key:
-                            task_desc += f" [Jira: {jira_key}]"
-                        
-                        db_task = Task(
-                            member_id=member.member_id,
-                            description=task_desc,
-                            deadline=deadline
-                        )
-                        db.add(db_task)
-                        db.commit()
-                        
-                        result["db_tasks"].append({
-                            "task_id": db_task.task_id,
-                            "member": member.member_name
-                        })
-                        logger.info(f"📊 Stored in DB: task_id={db_task.task_id}")
-                    else:
-                        logger.warning(f"⚠️ No matching member for '{matched_assignee}'")
-            except Exception as db_err:
-                logger.error(f"❌ DB error: {db_err}")
-        
-        # Store transcription and meeting record
+        # Step 2: Extract tasks using LLM
         try:
+            logger.info(f"🤖 Step 2: Extracting tasks via LLM...")
+            
+            llm = get_llm_client()
+            if not llm.is_configured:
+                logger.warning("LLM not configured, skipping task extraction")
+            else:
+                # Get summary
+                try:
+                    summary = llm.summarize_meeting(transcript)
+                    result["summary"] = summary
+                    logger.info(f"📋 Summary: {summary[:100]}...")
+                except Exception as sum_err:
+                    logger.error(f"❌ Summary error: {sum_err}")
+                    summary = transcript[:500]
+                    result["summary"] = summary
+                
+                # Extract tasks with safe extraction
+                try:
+                    llm_response = None
+                    try:
+                        tasks_result = llm.extract_tasks(transcript, summary)
+                        # Get raw response for safe extraction
+                        llm_response = str(tasks_result) if tasks_result else None
+                    except Exception:
+                        llm_response = None
+                    
+                    # Use safe extraction with fallbacks
+                    extraction_result = safe_extract_tasks(
+                        transcript=transcript,
+                        summary=summary,
+                        llm_response=llm_response
+                    )
+                    tasks = extraction_result.get("tasks", [])
+                    result["tasks"] = tasks
+                    logger.info(f"📋 Extracted {len(tasks)} task(s) via {extraction_result.get('extraction_method', 'unknown')}")
+                    
+                except Exception as task_err:
+                    logger.error(f"❌ Task extraction error: {task_err}")
+                    tasks = []
+        
+        except Exception as e:
+            logger.error(f"❌ LLM step error: {e}")
+            # Continue with empty tasks
+        
+        # Step 3: Create Jira tickets
+        action_items = []  # For Confluence
+        try:
+            logger.info(f"🎫 Step 3: Creating Jira tickets...")
+            
+            jira = get_jira_client()
+            
+            for task in tasks:
+                task_desc = task.get("description") or task.get("title", "Untitled Task")
+                raw_assignee = task.get("assignee")
+                due_date_str = task.get("due_date")
+                
+                # Map assignee using improved matching
+                matched_assignee = None
+                match_result = match_member_name(raw_assignee) if raw_assignee else None
+                if match_result:
+                    matched_assignee = match_result[0]
+                    logger.info(f"👤 Mapped '{raw_assignee}' -> '{matched_assignee}' (score: {match_result[1]:.2f})")
+                
+                # Parse due date with natural language support
+                parsed_due_date = parse_due_date(due_date_str) if due_date_str else None
+                due_date_iso = format_date_iso(parsed_due_date) if parsed_due_date else None
+                
+                if due_date_str and parsed_due_date:
+                    logger.info(f"📅 Parsed date '{due_date_str}' -> '{due_date_iso}'")
+                
+                # Create Jira ticket
+                jira_key = None
+                if jira.is_configured:
+                    try:
+                        description = f"Task extracted from meeting recording: {filename}\n\nAssignee mentioned: {raw_assignee or 'Unassigned'}"
+                        
+                        jira_result = jira.create_issue(
+                            summary=task_desc[:255],
+                            description=description,
+                            issue_type="Task",
+                            assignee_name=matched_assignee,
+                            due_date=due_date_iso
+                        )
+                        
+                        jira_key = jira_result.get("key") if isinstance(jira_result, dict) else jira_result
+                        if jira_key:
+                            logger.info(f"✅ Created Jira ticket: {jira_key}")
+                            result["jira_tickets"].append(jira_key)
+                    except Exception as jira_err:
+                        logger.error(f"❌ Jira error for task '{task_desc[:50]}': {jira_err}")
+                else:
+                    logger.warning("Jira not configured, skipping ticket creation")
+                
+                # Collect for Confluence
+                action_items.append({
+                    "jira_key": jira_key,
+                    "description": task_desc,
+                    "assignee": matched_assignee or raw_assignee or "Unassigned"
+                })
+                
+                # Store task in database
+                try:
+                    with get_db_session() as db:
+                        member = None
+                        if matched_assignee:
+                            member = db.query(Member).filter(
+                                Member.member_name.ilike(f"%{matched_assignee}%")
+                            ).first()
+                        
+                        if member:
+                            deadline = parsed_due_date or get_default_deadline(7)
+                            
+                            task_desc_with_jira = task_desc
+                            if jira_key:
+                                task_desc_with_jira += f" [Jira: {jira_key}]"
+                            
+                            db_task = Task(
+                                member_id=member.member_id,
+                                description=task_desc_with_jira,
+                                deadline=deadline
+                            )
+                            db.add(db_task)
+                            db.commit()
+                            
+                            result["db_tasks"].append({
+                                "task_id": db_task.task_id,
+                                "member": member.member_name
+                            })
+                            logger.info(f"📊 Stored in DB: task_id={db_task.task_id}")
+                        else:
+                            if matched_assignee:
+                                logger.warning(f"⚠️ No DB member found for '{matched_assignee}'")
+                except Exception as db_err:
+                    logger.error(f"❌ DB error storing task: {db_err}")
+            
+        except Exception as e:
+            logger.error(f"❌ Jira step error: {e}")
+            # Continue to Confluence and DB
+        
+        # Step 4: Create/Update Confluence page
+        try:
+            logger.info(f"📄 Step 4: Creating Confluence page...")
+            
+            confluence = get_confluence_client()
+            
+            if confluence.is_configured:
+                # Build page HTML
+                page_html = build_simple_meeting_page(
+                    meeting_date=meeting_date_str,
+                    summary=summary or "No summary available",
+                    action_items=action_items if action_items else None,
+                    transcript=transcript,
+                    jira_base_url=settings.jira_server
+                )
+                
+                # Create/update page
+                page_title = f"Meeting {meeting_date_str}"
+                try:
+                    confluence_result = confluence.create_or_update_page(page_title, page_html)
+                    if confluence_result:
+                        result["confluence_page_id"] = confluence_result.get("page_id")
+                        result["confluence_url"] = confluence_result.get("page_url")
+                        action = confluence_result.get("action", "created")
+                        logger.info(f"✅ Confluence page {action}: {result['confluence_url']}")
+                    else:
+                        logger.warning("⚠️ Confluence page creation returned None")
+                except Exception as conf_err:
+                    logger.error(f"❌ Confluence error: {conf_err}")
+            else:
+                logger.warning("Confluence not configured, skipping page creation")
+                
+        except Exception as e:
+            logger.error(f"❌ Confluence step error: {e}")
+        
+        # Step 5: Store transcription and meeting record
+        try:
+            logger.info(f"💾 Step 5: Storing meeting record...")
+            
             with get_db_session() as db:
                 # Create transcription
-                transcription = Transcription(transcription_summary=summary or transcript[:500])
-                db.add(transcription)
+                transcription_record = Transcription(transcription_summary=summary or (transcript[:500] if transcript else ""))
+                db.add(transcription_record)
                 db.flush()
                 
-                # Create meeting
+                # Create meeting with Confluence info
                 meeting = Meeting(
                     meeting_date=date.today(),
-                    transcription_id=transcription.transcription_id
+                    transcription_id=transcription_record.transcription_id,
+                    confluence_page_id=result.get("confluence_page_id"),
+                    confluence_url=result.get("confluence_url")
                 )
                 db.add(meeting)
                 db.commit()
+                
+                result["meeting_id"] = meeting.meeting_id
                 logger.info(f"📊 Created meeting record: meeting_id={meeting.meeting_id}")
+                
         except Exception as db_err:
             logger.error(f"❌ Failed to store meeting record: {db_err}")
         
@@ -290,21 +410,21 @@ def process_recording_file(file_path: Path) -> Dict[str, Any]:
         
         return result
         
-    except Exception as e:
-        logger.error(f"❌ Error processing {filename}: {e}")
-        result["error"] = str(e)
-        return result
+    finally:
+        # Always remove from processing set
+        _currently_processing.discard(filename)
 
 
 def poll_and_process_recordings() -> Dict[str, Any]:
     """
     Poll for new recordings and process them.
     This is the main polling function called by the scheduler.
+    Uses a lock to prevent overlapping processing when jobs run longer than interval.
     
     Returns:
         Summary of processing results
     """
-    logger.info("Starting recording poll cycle...")
+    global _is_processing
     
     results = {
         "processed": 0,
@@ -313,7 +433,16 @@ def poll_and_process_recordings() -> Dict[str, Any]:
         "files": []
     }
     
+    # Try to acquire lock (non-blocking)
+    if not _processing_lock.acquire(blocking=False):
+        logger.warning("⏭️ Skipping poll cycle - previous processing still in progress")
+        results["skipped"] = 1
+        return results
+    
     try:
+        _is_processing = True
+        logger.info("🔄 Starting recording poll cycle...")
+        
         # Scan for new files
         new_files = scan_for_new_recordings()
         
@@ -336,6 +465,8 @@ def poll_and_process_recordings() -> Dict[str, Any]:
                 results["files"].append({
                     "filename": file_path.name,
                     "success": result.get('error') is None,
+                    "jira_tickets": result.get('jira_tickets', []),
+                    "confluence_url": result.get('confluence_url'),
                     "error": result.get('error')
                 })
                 
@@ -349,13 +480,16 @@ def poll_and_process_recordings() -> Dict[str, Any]:
                 })
         
         logger.info(
-            f"Poll cycle complete. "
+            f"✅ Poll cycle complete. "
             f"Processed: {results['processed']}, "
             f"Errors: {results['errors']}"
         )
         
     except Exception as e:
         logger.error(f"Error during poll cycle: {e}")
+    finally:
+        _is_processing = False
+        _processing_lock.release()
     
     return results
 
