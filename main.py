@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta
 from typing import List, Optional
+import json
 
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -42,6 +44,22 @@ from app.llm import get_llm_client
 from app.pipeline import process_meeting, process_recording
 from app.logger import setup_logging, get_logger
 
+# GitHub MCP Server integration
+try:
+    from github_mcp_server import github_client as gh
+    from github_mcp_server import summarizer as llm_summary
+    GITHUB_MCP_AVAILABLE = True
+except ImportError:
+    GITHUB_MCP_AVAILABLE = False
+    gh = None  # type: ignore
+    llm_summary = None  # type: ignore
+
+# Configure logging
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper()),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 # Configure logging with custom formatter
 setup_logging(level=settings.log_level, use_colors=True)
 logger = get_logger(__name__)
@@ -104,6 +122,92 @@ class RecordingFileInfo(BaseModel):
     size_mb: float
     modified_at: str
     processed: bool
+
+
+class GitHubProgressReport(BaseModel):
+    summary: str
+    highlights: List[str]
+    risks: List[str]
+    contributor_summary: str
+    velocity: str
+    raw_data: dict
+    period: Optional[str] = None
+    total_commits: Optional[int] = None
+    contributors: Optional[int] = None
+
+
+class GitHubCommit(BaseModel):
+    sha: str
+    message: str
+    author: str
+    date: str
+    url: str
+
+
+class GitHubCommitDetail(BaseModel):
+    sha: str
+    message: str
+    author: str
+    date: str
+    stats: dict
+    files_changed: List[dict]
+    url: str
+
+
+class GitHubContributor(BaseModel):
+    login: str
+    contributions: int
+    avatar_url: str
+    profile_url: str
+
+
+class GitHubRepoInfo(BaseModel):
+    name: str
+    description: str
+    language: str
+    stars: int
+    forks: int
+    open_issues: int
+    url: str
+
+
+# --- New models for frontend integration ---
+
+class DeveloperSummaryResponse(BaseModel):
+    developer_id: int
+    member_name: str
+    designation: str
+    total_tasks: int
+    tasks: List[TaskResponse]
+    github_commits: int
+    summary: str
+
+
+class EnhancedMeetingResponse(BaseModel):
+    meeting_id: int
+    meeting_date: str
+    summary: Optional[str] = None
+    key_decisions: List[str] = []
+    action_items: List[str] = []
+    participants: List[str] = []
+
+
+class EnhancedMeetingListResponse(BaseModel):
+    meetings: List[EnhancedMeetingResponse]
+    total: int
+
+
+class NLTaskAssignRequest(BaseModel):
+    text: str
+
+
+class NLTaskAssignResponse(BaseModel):
+    task_id: int
+    member_id: int
+    member_name: str
+    description: str
+    deadline: str
+    raw_input: str
 
 
 @asynccontextmanager
@@ -399,6 +503,398 @@ def create_app() -> FastAPI:
         db.commit()
         
         return {"message": f"Meeting {meeting_id} deleted"}
+
+    # ==========================================================
+    # Enhanced Meetings Endpoint (for React frontend)
+    # ==========================================================
+
+    @app.get("/api/meetings", response_model=EnhancedMeetingListResponse, tags=["Meetings"])
+    async def list_meetings_enhanced(
+        skip: int = 0,
+        limit: int = 50,
+        db: Session = Depends(get_db)
+    ):
+        """
+        List meetings with enriched data: summary, key_decisions,
+        action_items, and participants.
+        """
+        query = db.query(Meeting)
+        total = query.count()
+        meetings = query.order_by(Meeting.meeting_date.desc()).offset(skip).limit(limit).all()
+
+        result = []
+        for m in meetings:
+            # Transcription summary
+            transcription = db.query(Transcription).filter(
+                Transcription.transcription_id == m.transcription_id
+            ).first()
+            summary_text = transcription.transcription_summary if transcription else None
+
+            # Gather participants from tasks linked to this meeting's members
+            # Since tasks don't have a direct meeting FK, pull unique member names
+            # from all tasks as a best-effort participant list
+            all_members = db.query(Member).all()
+            participants = [mb.member_name for mb in all_members]
+
+            # Extract key_decisions and action_items from summary via simple heuristic
+            key_decisions: List[str] = []
+            action_items: List[str] = []
+            if summary_text:
+                lines = summary_text.split("\n")
+                for line in lines:
+                    stripped = line.strip().lstrip("- *")
+                    if not stripped:
+                        continue
+                    lower = stripped.lower()
+                    if any(kw in lower for kw in ["decided", "decision", "agreed", "approved", "finalized"]):
+                        key_decisions.append(stripped)
+                    elif any(kw in lower for kw in ["action", "todo", "assign", "task", "need to", "should", "must", "will"]):
+                        action_items.append(stripped)
+
+            result.append(EnhancedMeetingResponse(
+                meeting_id=m.meeting_id,
+                meeting_date=m.meeting_date.isoformat() if m.meeting_date else "",
+                summary=summary_text,
+                key_decisions=key_decisions,
+                action_items=action_items,
+                participants=participants,
+            ))
+
+        return EnhancedMeetingListResponse(meetings=result, total=total)
+
+    # ==========================================================
+    # Developer Summary Endpoint
+    # ==========================================================
+
+    @app.get("/api/developers/{developer_id}/summary", response_model=DeveloperSummaryResponse, tags=["Developers"])
+    async def get_developer_summary(developer_id: int, db: Session = Depends(get_db)):
+        """
+        Get an LLM-generated summary for a developer combining their
+        database tasks and GitHub commit history.
+        """
+        member = db.query(Member).filter(Member.member_id == developer_id).first()
+        if not member:
+            raise HTTPException(status_code=404, detail=f"Developer with id {developer_id} not found")
+
+        # Fetch tasks from DB
+        tasks = db.query(Task).filter(Task.member_id == developer_id).all()
+        task_responses = [
+            TaskResponse(
+                task_id=t.task_id,
+                member_id=t.member_id,
+                member_name=member.member_name,
+                description=t.description,
+                deadline=t.deadline.isoformat() if t.deadline else "",
+            )
+            for t in tasks
+        ]
+
+        # Fetch GitHub commits for this developer (by name match)
+        github_commits_count = 0
+        commit_lines: List[str] = []
+        if GITHUB_MCP_AVAILABLE and gh is not None:
+            try:
+                all_commits = gh.get_recent_commits(since_days=30, per_page=100)
+                dev_commits = [
+                    c for c in all_commits
+                    if member.member_name.lower() in c.get("author", "").lower()
+                ]
+                github_commits_count = len(dev_commits)
+                commit_lines = [
+                    f"- [{c['sha']}] {c['message']}" for c in dev_commits[:20]
+                ]
+            except Exception as exc:
+                logger.warning(f"Could not fetch GitHub commits for developer: {exc}")
+
+        # Build LLM summary
+        summary_text = f"{member.member_name} has {len(tasks)} task(s) and {github_commits_count} recent commit(s)."
+        llm_client = get_llm_client()
+        if llm_client.is_configured:
+            try:
+                task_desc = "\n".join([f"- {t.description} (due {t.deadline})" for t in tasks]) or "No tasks assigned."
+                commit_desc = "\n".join(commit_lines) or "No recent commits."
+                prompt = (
+                    f"Developer: {member.member_name} ({member.designation})\n\n"
+                    f"Current Tasks:\n{task_desc}\n\n"
+                    f"Recent Git Commits (last 30 days):\n{commit_desc}\n\n"
+                    f"Write a concise 2-3 sentence developer summary covering workload, "
+                    f"recent contributions, and any observations."
+                )
+                summary_text = llm_client.summarize_meeting(prompt)
+            except Exception as exc:
+                logger.warning(f"LLM summary failed for developer: {exc}")
+
+        return DeveloperSummaryResponse(
+            developer_id=developer_id,
+            member_name=member.member_name,
+            designation=member.designation,
+            total_tasks=len(tasks),
+            tasks=task_responses,
+            github_commits=github_commits_count,
+            summary=summary_text,
+        )
+
+    # ==========================================================
+    # Natural-Language Task Assignment Endpoint
+    # ==========================================================
+
+    @app.post("/api/tasks/assign-nl", response_model=NLTaskAssignResponse, tags=["Tasks"])
+    async def assign_task_nl(request: NLTaskAssignRequest, db: Session = Depends(get_db)):
+        """
+        Accept natural-language text, use LLM to extract a structured task,
+        match the assignee to a team member, and create the task in the database.
+
+        Example input:
+            {"text": "Assign Kailas to fix the login bug by next Friday"}
+        """
+        llm_client = get_llm_client()
+        if not llm_client.is_configured:
+            raise HTTPException(status_code=503, detail="LLM not configured")
+
+        # Fetch all members for name matching
+        members = db.query(Member).all()
+        member_names = [m.member_name for m in members]
+
+        # Use LLM to parse the NL text
+        from langchain_core.messages import HumanMessage as HM, SystemMessage as SM
+
+        today_str = date.today().isoformat()
+        system_prompt = (
+            "You are a task parser. Given a natural language instruction and a list of team members, "
+            "extract a structured task. Return ONLY valid JSON with these keys:\n"
+            '  "assignee": exact name from the team list (or "Unassigned"),\n'
+            '  "description": concise task description,\n'
+            f'  "deadline": date in YYYY-MM-DD format (today is {today_str}; '
+            f'if relative like "next Friday", compute the actual date).\n'
+            f"\nTeam members: {', '.join(member_names)}"
+        )
+        user_prompt = f"Instruction: {request.text}\n\nJSON:"
+
+        try:
+            messages = [SM(content=system_prompt), HM(content=user_prompt)]
+            response = llm_client._llm.invoke(messages)
+            raw_text = response.content if isinstance(response.content, str) else str(response.content)
+            raw_text = raw_text.strip()
+
+            # Parse JSON
+            parsed = llm_client._parse_json_response(raw_text)
+
+            assignee_name = parsed.get("assignee", "Unassigned")
+            description = parsed.get("description", request.text)
+            deadline_str = parsed.get("deadline", (date.today() + timedelta(days=7)).isoformat())
+
+        except Exception as exc:
+            logger.warning(f"LLM parse failed, using fallback: {exc}")
+            assignee_name = "Unassigned"
+            description = request.text
+            deadline_str = (date.today() + timedelta(days=7)).isoformat()
+
+        # Match assignee to a member
+        matched_member = None
+        for m in members:
+            if m.member_name.lower() == assignee_name.lower():
+                matched_member = m
+                break
+        if not matched_member:
+            # Fuzzy: check if assignee name is contained in any member name
+            for m in members:
+                if assignee_name.lower() in m.member_name.lower() or m.member_name.lower() in assignee_name.lower():
+                    matched_member = m
+                    break
+        if not matched_member:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not match assignee '{assignee_name}' to any team member. "
+                       f"Available members: {', '.join(member_names)}"
+            )
+
+        # Parse deadline
+        try:
+            task_deadline = date.fromisoformat(deadline_str)
+        except (ValueError, TypeError):
+            task_deadline = date.today() + timedelta(days=7)
+
+        # Create task in DB
+        new_task = Task(
+            member_id=matched_member.member_id,
+            description=description,
+            deadline=task_deadline,
+        )
+        db.add(new_task)
+        db.commit()
+        db.refresh(new_task)
+
+        return NLTaskAssignResponse(
+            task_id=new_task.task_id,
+            member_id=matched_member.member_id,
+            member_name=matched_member.member_name,
+            description=description,
+            deadline=task_deadline.isoformat(),
+            raw_input=request.text,
+        )
+
+    # ==========================================================
+    # GitHub MCP Server - Commit Status & Progress Tracking
+    # ==========================================================
+
+    @app.get("/api/github/health", tags=["GitHub Commit Tracking"])
+    async def github_health():
+        """Check GitHub MCP server configuration status."""
+        if not GITHUB_MCP_AVAILABLE:
+            return {
+                "status": "unavailable",
+                "message": "GitHub MCP server not installed",
+                "github_configured": False,
+                "llm_configured": False,
+            }
+        from github_mcp_server.config import settings as gh_settings
+        return {
+            "status": "ok",
+            "service": "github-mcp-server",
+            "github_configured": bool(gh_settings.github_token),
+            "llm_configured": bool(gh_settings.groq_api_key),
+            "repo": f"{gh_settings.github_owner}/{gh_settings.github_repo}",
+        }
+
+    @app.get("/api/github/commits", tags=["GitHub Commit Tracking"], response_model=List[GitHubCommit])
+    async def get_github_commits(
+        branch: Optional[str] = Query(None, description="Branch name"),
+        since_days: int = Query(7, ge=1, le=365, description="Days to look back"),
+        per_page: int = Query(30, ge=1, le=100, description="Max commits"),
+    ):
+        """Fetch recent commits from GitHub repository."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_recent_commits(branch=branch, since_days=since_days, per_page=per_page)
+        except Exception as exc:
+            logger.exception("Error fetching GitHub commits")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/commits/{sha}", tags=["GitHub Commit Tracking"], response_model=GitHubCommitDetail)
+    async def get_github_commit_detail(sha: str):
+        """Get detailed info for a single commit including file changes."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_commit_detail(sha)
+        except Exception as exc:
+            logger.exception(f"Error fetching commit {sha}")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/commits/{sha}/summary", tags=["GitHub Commit Tracking"])
+    async def get_github_commit_summary(sha: str):
+        """Get an LLM-generated summary of a single commit."""
+        if not GITHUB_MCP_AVAILABLE or gh is None or llm_summary is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            detail = gh.get_commit_detail(sha)
+            summary = llm_summary.summarize_commit_detail(detail)
+            return {
+                "sha": sha,
+                "summary": summary,
+            }
+        except Exception as exc:
+            logger.exception(f"Error summarizing commit {sha}")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/commits-summary", tags=["GitHub Commit Tracking"])
+    async def get_github_commits_summary(
+        branch: Optional[str] = Query(None),
+        since_days: int = Query(7, ge=1, le=365),
+    ):
+        """LLM-generated summary of recent commits (progress summary)."""
+        if not GITHUB_MCP_AVAILABLE or gh is None or llm_summary is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            commits = gh.get_recent_commits(branch=branch, since_days=since_days)
+            summary = llm_summary.summarize_commits(commits)
+            return {
+                "total_commits": len(commits),
+                "since_days": since_days,
+                "branch": branch or "default",
+                "summary": summary,
+            }
+        except Exception as exc:
+            logger.exception("Error generating GitHub commit summary")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/progress-report", tags=["GitHub Commit Tracking"], response_model=GitHubProgressReport)
+    async def get_github_progress_report(since_days: int = Query(7, ge=1, le=365)):
+        """Full LLM-powered progress report for the dashboard (commits + contributors + PRs)."""
+        if not GITHUB_MCP_AVAILABLE or gh is None or llm_summary is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            commits = gh.get_recent_commits(since_days=since_days)
+            contributors = gh.get_contributors()
+            repo_info = gh.get_repo_info()
+            prs = gh.get_recent_pull_requests(state="all", per_page=10)
+            report = llm_summary.generate_progress_report(commits, contributors, repo_info, prs)
+            report["period"] = f"Last {since_days} days"
+            report["total_commits"] = len(commits)
+            report["contributors"] = len(contributors)
+            return report
+        except Exception as exc:
+            logger.exception("Error generating GitHub progress report")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/contributors", tags=["GitHub Commit Tracking"], response_model=List[GitHubContributor])
+    async def get_github_contributors():
+        """Fetch repository contributors with commit counts."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_contributors()
+        except Exception as exc:
+            logger.exception("Error fetching GitHub contributors")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/repo-info", tags=["GitHub Commit Tracking"], response_model=GitHubRepoInfo)
+    async def get_github_repo_info():
+        """Fetch basic repository metadata (stars, language, etc.)."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_repo_info()
+        except Exception as exc:
+            logger.exception("Error fetching GitHub repo info")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/commit-activity", tags=["GitHub Commit Tracking"])
+    async def get_github_commit_activity():
+        """Weekly commit activity for the past year (for charts)."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_commit_activity()
+        except Exception as exc:
+            logger.exception("Error fetching GitHub commit activity")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/pull-requests", tags=["GitHub Commit Tracking"])
+    async def get_github_pull_requests(
+        state: str = Query("all", pattern="^(open|closed|all)$"),
+        per_page: int = Query(10, ge=1, le=100),
+    ):
+        """Fetch recent pull requests."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_recent_pull_requests(state=state, per_page=per_page)
+        except Exception as exc:
+            logger.exception("Error fetching GitHub pull requests")
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    @app.get("/api/github/branches", tags=["GitHub Commit Tracking"])
+    async def get_github_branches():
+        """List repository branches."""
+        if not GITHUB_MCP_AVAILABLE or gh is None:
+            raise HTTPException(status_code=503, detail="GitHub MCP server not available")
+        try:
+            return gh.get_branches()
+        except Exception as exc:
+            logger.exception("Error fetching GitHub branches")
+            raise HTTPException(status_code=502, detail=str(exc))
 
     return app
 
