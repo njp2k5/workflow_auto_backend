@@ -5,7 +5,6 @@ Uses Confluence REST API v1.
 Base URL should be https://<site>.atlassian.net/wiki (with /wiki).
 If /wiki is not present, it is automatically appended.
 """
-import logging
 import re
 from typing import Optional, Dict, Any, List
 
@@ -14,8 +13,9 @@ from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 
 from app.config import settings
+from app.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _safe_confluence_request(method: str, url: str, **kwargs) -> Dict[str, Any]:
@@ -478,6 +478,157 @@ class ConfluenceClient:
             "title": page_title,
             "version": current_version + 1
         }
+    
+    def search_pages(self, query: str, max_results: int = 10) -> List[Dict[str, Any]]:
+        """
+        Search for pages in the space using CQL.
+        
+        Args:
+            query: Search query text
+            max_results: Maximum number of results
+            
+        Returns:
+            List of matching pages with id, title, and url
+        """
+        if not self.is_configured:
+            return []
+        
+        # Use CQL to search for pages containing the query
+        cql = f'space = "{self.space_key}" AND type = page AND text ~ "{query}"'
+        
+        url = self._api_url("/content/search")
+        params = {
+            "cql": cql,
+            "limit": max_results
+        }
+        
+        data = _safe_confluence_request(
+            "GET", url,
+            params=params,
+            headers=self.headers,
+            auth=self.auth,
+            timeout=30
+        )
+        
+        if data.get("fallback"):
+            logger.warning(f"Page search failed: {data.get('html_title')}")
+            return []
+        
+        results = []
+        for item in data.get("results", []):
+            page_url = item.get("_links", {}).get("webui", "")
+            if page_url:
+                page_url = f"{self.base_url}{page_url}"
+            
+            results.append({
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "url": page_url
+            })
+        
+        logger.debug(f"Page search for '{query}' found {len(results)} results")
+        return results
+    
+    def find_project_page(self, project_name: str) -> Optional[Dict[str, Any]]:
+        """
+        Find an existing Confluence page for a project.
+        Searches for pages with the project name in the title.
+        
+        Args:
+            project_name: Name of the project to search for
+            
+        Returns:
+            Page info dict (id, title, url) if found, None otherwise
+        """
+        if not project_name:
+            return None
+        
+        # First try exact title match
+        exact_page_id = self.find_page_by_title(f"{project_name} - Development")
+        if exact_page_id:
+            return {
+                "id": exact_page_id,
+                "title": f"{project_name} - Development",
+                "url": f"{self.base_url}/spaces/{self.space_key}/pages/{exact_page_id}"
+            }
+        
+        # Try project name as title
+        exact_page_id = self.find_page_by_title(project_name)
+        if exact_page_id:
+            return {
+                "id": exact_page_id,
+                "title": project_name,
+                "url": f"{self.base_url}/spaces/{self.space_key}/pages/{exact_page_id}"
+            }
+        
+        # Search for pages containing project name
+        results = self.search_pages(project_name, max_results=5)
+        
+        for result in results:
+            title = result.get("title", "").lower()
+            project_lower = project_name.lower()
+            
+            # Check if project name is prominently in the title
+            if project_lower in title:
+                logger.info(f"Found existing project page: '{result.get('title')}' (ID: {result.get('id')})")
+                return result
+        
+        logger.debug(f"No existing page found for project: {project_name}")
+        return None
+    
+    def create_or_update_project_page(
+        self,
+        project_name: str,
+        title: str,
+        html: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Create a new project page or update an existing one if found.
+        
+        Args:
+            project_name: Project name to search for existing pages
+            title: Page title (used for new pages)
+            html: HTML content
+            
+        Returns:
+            Dictionary with page_id, page_url, action, and decision explanation
+        """
+        decision_log = []
+        
+        # Check for existing project page
+        existing_page = self.find_project_page(project_name) if project_name else None
+        
+        if existing_page:
+            decision_log.append(f"Found existing page for '{project_name}': {existing_page.get('title')}")
+            result = self.update_page(existing_page["id"], html, existing_page.get("title"))
+            if result:
+                result["action"] = "updated"
+                result["decision"] = f"Updated existing project page: {existing_page.get('title')}"
+                result["decision_log"] = decision_log
+                return result
+        else:
+            if project_name:
+                decision_log.append(f"No existing page found for project '{project_name}'")
+            decision_log.append(f"Creating new page: {title}")
+        
+        # Check for page with exact title
+        existing_page_id = self.find_page_by_title(title)
+        
+        if existing_page_id:
+            decision_log.append(f"Found page with same title, updating instead of creating")
+            result = self.update_page(existing_page_id, html, title)
+            if result:
+                result["action"] = "updated"
+                result["decision"] = f"Updated existing page with same title"
+                result["decision_log"] = decision_log
+        else:
+            result = self.create_page(title, html)
+            if result:
+                result["action"] = "created"
+                result["decision"] = f"Created new page: {title}"
+                result["decision_log"] = decision_log
+        
+        return result
     
     def create_or_update_page(self, title: str, html: str) -> Optional[Dict[str, Any]]:
         """

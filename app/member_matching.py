@@ -2,12 +2,13 @@
 Member name matching utilities with fuzzy matching, alias support, and initials expansion.
 Handles variations like "V.S." → "Mukundan V S", "Kyla" → "Kailas S S".
 """
-import logging
 import re
 from difflib import SequenceMatcher
 from typing import Optional, List, Dict, Tuple
 
-logger = logging.getLogger(__name__)
+from app.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 # Team members for matching (can be overridden)

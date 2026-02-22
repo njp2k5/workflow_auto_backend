@@ -2,7 +2,6 @@
 LLM interface using Groq API for meeting summarization and task extraction.
 """
 import json
-import logging
 from typing import Optional, List, Dict, Any
 
 # Try to import langchain_groq, but allow fallback if not installed
@@ -21,14 +20,15 @@ except ImportError:
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
+from app.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class LLMClient:
     """
     LLM interface using Groq API with LangChain.
-    Handles meeting summarization and task extraction.
+    Handles meeting summarization, title extraction, and task extraction.
     """
     
     def __init__(self):
@@ -57,6 +57,125 @@ class LLMClient:
         """Check if the LLM is properly configured."""
         return self._llm is not None
     
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def extract_meeting_title(self, transcript: str) -> str:
+        """
+        Extract a meaningful meeting title from the transcript.
+        Identifies project names, topics, or key themes discussed.
+        
+        Args:
+            transcript: Meeting transcript
+            
+        Returns:
+            Extracted meeting title
+        """
+        if not self.is_configured:
+            raise RuntimeError("LLM client not configured")
+        
+        system_prompt = """Extract a concise, descriptive meeting title from the transcript.
+
+RULES:
+1. Identify the main project, topic, or theme of the meeting
+2. If a project name is mentioned, include it (e.g., "Project Alpha Sprint Planning")
+3. If no specific project, use the main topic discussed
+4. Keep title under 60 characters
+5. Format: "[Project/Topic] - [Meeting Type]" or just "[Main Topic]"
+6. Examples: "Project Phoenix - Weekly Sync", "API Integration Review", "Q4 Budget Planning"
+7. Return ONLY the title, no explanation"""
+
+        user_prompt = f"""Extract a meeting title from this transcript:
+
+{transcript[:2000]}
+
+Meeting Title:"""
+
+        try:
+            messages = [
+                SystemMessage(content=system_prompt),  # type: ignore[misc]
+                HumanMessage(content=user_prompt)  # type: ignore[misc]
+            ]
+            
+            response = self._llm.invoke(messages)  # type: ignore
+            content = response.content
+            title = content if isinstance(content, str) else str(content)
+            title = title.strip().strip('"\'')
+            
+            # Ensure reasonable length
+            if len(title) > 80:
+                title = title[:77] + "..."
+            
+            logger.info(f"Extracted meeting title: {title}")
+            return title
+            
+        except Exception as e:
+            logger.error(f"Error extracting meeting title: {e}")
+            return "Team Meeting"
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10)
+    )
+    def extract_project_name(self, transcript: str, summary: Optional[str] = None) -> Optional[str]:
+        """
+        Extract the project or product name from the meeting transcript.
+        Used to find existing Confluence pages for the project.
+        
+        Args:
+            transcript: Meeting transcript
+            summary: Optional meeting summary
+            
+        Returns:
+            Project name or None if not identified
+        """
+        if not self.is_configured:
+            raise RuntimeError("LLM client not configured")
+        
+        context = transcript[:1500]
+        if summary:
+            context = f"Summary: {summary}\n\nTranscript: {transcript[:1000]}"
+        
+        system_prompt = """Extract the project or product name from the meeting discussion.
+
+RULES:
+1. Look for explicit project names (e.g., "Project Alpha", "Phoenix App", "Customer Portal")
+2. Look for product names being discussed
+3. If multiple projects mentioned, return the main one being discussed
+4. Return ONLY the project/product name, nothing else
+5. If no clear project name, return "NONE"
+6. Do NOT make up a project name
+7. Examples of valid outputs: "Project Alpha", "E-Commerce Platform", "Mobile App v2", "NONE" """
+
+        user_prompt = f"""What project or product is being discussed in this meeting?
+
+{context}
+
+Project Name:"""
+
+        try:
+            messages = [
+                SystemMessage(content=system_prompt),  # type: ignore[misc]
+                HumanMessage(content=user_prompt)  # type: ignore[misc]
+            ]
+            
+            response = self._llm.invoke(messages)  # type: ignore
+            content = response.content
+            project = content if isinstance(content, str) else str(content)
+            project = project.strip().strip('"\'')
+            
+            if project.upper() in ["NONE", "N/A", "NOT FOUND", "UNKNOWN", ""]:
+                logger.info("No specific project name identified in transcript")
+                return None
+            
+            logger.info(f"Extracted project name: {project}")
+            return project
+            
+        except Exception as e:
+            logger.error(f"Error extracting project name: {e}")
+            return None
+
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10)
@@ -272,18 +391,22 @@ Respond with JSON only:"""
     
     def analyze_meeting(self, transcript: str) -> Dict[str, Any]:
         """
-        Perform complete meeting analysis: summarize and extract tasks.
+        Perform complete meeting analysis: title, summary, project, and tasks.
         
         Args:
             transcript: Full meeting transcript
             
         Returns:
-            Dictionary with summary and tasks
+            Dictionary with meeting_title, project_name, summary, and tasks
         """
+        meeting_title = self.extract_meeting_title(transcript)
         summary = self.summarize_meeting(transcript)
+        project_name = self.extract_project_name(transcript, summary)
         tasks = self.extract_tasks(transcript, summary)
         
         return {
+            "meeting_title": meeting_title,
+            "project_name": project_name,
             "summary": summary,
             "tasks": tasks.get("tasks", [])
         }

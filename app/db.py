@@ -1,7 +1,6 @@
 """
 Database engine and session management.
 """
-import logging
 from contextlib import contextmanager
 from typing import Generator
 
@@ -10,8 +9,9 @@ from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import QueuePool
 
 from app.config import settings
+from app.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Create database engine with connection pooling
 engine = create_engine(

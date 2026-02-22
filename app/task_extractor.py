@@ -2,15 +2,15 @@
 Robust task extraction with JSON parsing improvements, retry logic, and regex fallback.
 """
 import json
-import logging
 import re
 from typing import Optional, List, Dict, Any
 from datetime import date
 
 from app.date_utils import parse_due_date, format_date_iso, get_default_deadline
 from app.member_matching import get_member_name
+from app.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # Task extraction schema for validation

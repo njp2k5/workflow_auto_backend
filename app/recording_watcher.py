@@ -3,7 +3,6 @@ Recording folder watcher and processor.
 Detects new recording files and triggers the transcription + processing pipeline.
 Includes full workflow: Transcription → LLM Task Extraction → Jira Ticket Creation → Confluence → DB Storage
 """
-import logging
 import os
 from datetime import datetime, date, timedelta
 from pathlib import Path
@@ -21,8 +20,9 @@ from app.models import Task, Member, Transcription, Meeting
 from app.date_utils import parse_due_date, format_date_iso, get_default_deadline
 from app.member_matching import get_member_name, match_member_name
 from app.task_extractor import safe_extract_tasks, validate_and_normalize_task
+from app.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Supported file extensions (including Google Meet formats)
 SUPPORTED_EXTENSIONS = {'.mp4', '.mp3', '.wav', '.m4a', '.mpeg', '.webm', '.mkv'}

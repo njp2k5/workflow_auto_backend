@@ -1,9 +1,8 @@
 """
 Jira Cloud API client for creating issues and managing tasks.
 """
-import logging
 import re
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from functools import lru_cache
 from difflib import SequenceMatcher
 
@@ -12,8 +11,9 @@ from requests.auth import HTTPBasicAuth
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.config import settings
+from app.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Team members for fuzzy matching
 TEAM_MEMBERS = [
@@ -75,7 +75,7 @@ def find_closest_team_member(name: str) -> Optional[str]:
 class JiraClient:
     """
     Client for interacting with Jira Cloud REST API v3.
-    Handles issue creation and user management.
+    Handles issue creation, duplicate detection, and user management.
     """
     
     def __init__(self):
@@ -244,6 +244,230 @@ class JiraClient:
         except Exception as e:
             logger.error(f"Error getting account ID for '{display_name}': {e}")
             return None
+    
+    # Stopwords to filter out when extracting keywords for duplicate search
+    STOPWORDS = frozenset({
+        'the', 'and', 'of', 'to', 'for', 'with', 'a', 'an', 'this', 'that',
+        'in', 'on', 'at', 'by', 'from', 'or', 'as', 'is', 'it', 'be', 'are',
+        'was', 'were', 'been', 'being', 'have', 'has', 'had', 'do', 'does',
+        'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must',
+        'shall', 'can', 'need', 'not', 'no', 'so', 'if', 'then', 'than',
+        'but', 'about', 'into', 'through', 'during', 'before', 'after',
+        'above', 'below', 'up', 'down', 'out', 'off', 'over', 'under',
+        'again', 'further', 'once', 'here', 'there', 'when', 'where', 'why',
+        'how', 'all', 'each', 'few', 'more', 'most', 'other', 'some', 'such',
+        'any', 'only', 'own', 'same', 'too', 'very', 'just', 'also'
+    })
+    
+    def _extract_keywords(self, text: str, min_length: int = 3, max_keywords: int = 5) -> List[str]:
+        """
+        Extract meaningful keywords from text, filtering stopwords.
+        
+        Args:
+            text: Input text to extract keywords from
+            min_length: Minimum word length to include
+            max_keywords: Maximum number of keywords to return
+            
+        Returns:
+            List of keywords suitable for JQL search
+        """
+        import re
+        # Split on non-alphanumeric, convert to lowercase
+        words = re.split(r'[^a-zA-Z0-9]+', text.lower())
+        
+        # Filter: not a stopword, meets minimum length, not purely numeric
+        keywords = [
+            word for word in words 
+            if word and len(word) >= min_length 
+            and word not in self.STOPWORDS
+            and not word.isdigit()
+        ]
+        
+        # Deduplicate while preserving order
+        seen = set()
+        unique_keywords = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                unique_keywords.append(kw)
+        
+        return unique_keywords[:max_keywords]
+    
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=5)
+    )
+    def search_issues(self, jql: str, max_results: int = 20) -> List[Dict[str, Any]]:
+        """
+        Search for issues using JQL via POST request.
+        
+        Jira Cloud deprecated GET /rest/api/3/search with JQL in URL.
+        Now uses POST with JSON body as per Atlassian documentation.
+        
+        Args:
+            jql: JQL query string
+            max_results: Maximum number of results to return
+            
+        Returns:
+            List of matching issues with key, summary, status, assignee fields
+        """
+        if not self.is_configured:
+            raise RuntimeError("Jira client not configured")
+        
+        url = f"{self.server}/rest/api/3/search"
+        
+        # POST body for Jira Cloud search API
+        payload = {
+            "jql": jql,
+            "maxResults": max_results,
+            "fields": ["summary", "status", "assignee", "key"]
+        }
+        
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=self.headers,
+                auth=self._auth,
+                timeout=30
+            )
+            
+            # Handle specific error codes
+            if response.status_code == 400:
+                error_data = response.json() if response.text else {}
+                error_msg = error_data.get("errorMessages", ["Invalid JQL query"])[0]
+                logger.warning(f"JQL syntax error: {error_msg}")
+                return []
+            
+            if response.status_code == 403:
+                logger.warning("Jira search permission denied (403)")
+                return []
+            
+            if response.status_code == 410:
+                logger.error("Jira search API returned 410 Gone - check API version")
+                return []
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            issues = data.get("issues", [])
+            logger.debug(f"JQL search returned {len(issues)} results for: {jql[:80]}...")
+            return issues
+            
+        except requests.exceptions.Timeout:
+            logger.error("Jira search timed out")
+            return []
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"Jira connection error: {e}")
+            return []
+        except requests.RequestException as e:
+            logger.error(f"Error searching issues: {e}")
+            return []
+    
+    def find_similar_issue(
+        self,
+        summary: str,
+        assignee_name: Optional[str] = None,
+        similarity_threshold: float = 0.8
+    ) -> Tuple[Optional[Dict[str, Any]], float]:
+        """
+        Find an existing issue with similar summary (potential duplicate).
+        
+        Uses keyword extraction with stopword filtering for better JQL queries.
+        
+        Args:
+            summary: Issue summary to search for
+            assignee_name: Optional assignee to narrow search
+            similarity_threshold: Minimum similarity ratio (0-1) to consider a match
+            
+        Returns:
+            Tuple of (matching issue dict or None, similarity score)
+        """
+        if not self.is_configured:
+            return None, 0.0
+        
+        # Build JQL query - search in project, open issues only
+        jql_parts = [f'project = "{self.project_key}"']
+        jql_parts.append('statusCategory != Done')
+        
+        # Extract meaningful keywords (filtered stopwords)
+        keywords = self._extract_keywords(summary, min_length=3, max_keywords=5)
+        
+        if keywords:
+            # Build text search: summary ~ "word1" OR summary ~ "word2"
+            text_search = " OR ".join([f'summary ~ "{kw}"' for kw in keywords])
+            jql_parts.append(f"({text_search})")
+        else:
+            logger.warning(f"No keywords extracted from summary: {summary[:50]}...")
+            return None, 0.0
+        
+        jql = " AND ".join(jql_parts)
+        logger.debug(f"Duplicate search JQL: {jql}")
+        
+        try:
+            issues = self.search_issues(jql, max_results=10)
+            
+            if not issues:
+                return None, 0.0
+            
+            best_match = None
+            best_score = 0.0
+            
+            summary_lower = summary.lower()
+            
+            for issue in issues:
+                existing_summary = issue.get("fields", {}).get("summary", "").lower()
+                
+                # Calculate similarity using SequenceMatcher
+                similarity = SequenceMatcher(None, summary_lower, existing_summary).ratio()
+                
+                # Boost score if assignee matches
+                if assignee_name:
+                    issue_assignee = issue.get("fields", {}).get("assignee", {})
+                    if issue_assignee:
+                        assignee_display = issue_assignee.get("displayName", "").lower()
+                        if assignee_name.lower() in assignee_display:
+                            similarity += 0.1  # Small boost for assignee match
+                
+                if similarity > best_score:
+                    best_score = similarity
+                    best_match = issue
+            
+            if best_score >= similarity_threshold:
+                issue_key = best_match.get("key") if best_match else "Unknown"
+                logger.info(f"Found similar issue: {issue_key} (similarity: {best_score:.2%})")
+                return best_match, best_score
+            
+            return None, best_score
+            
+        except Exception as e:
+            logger.error(f"Error finding similar issue: {e}")
+            return None, 0.0
+    
+    def check_for_duplicate(
+        self,
+        summary: str,
+        assignee_name: Optional[str] = None
+    ) -> Optional[str]:
+        """
+        Check if a similar ticket already exists.
+        
+        Args:
+            summary: Task summary to check
+            assignee_name: Optional assignee name
+            
+        Returns:
+            Existing issue key if duplicate found, None otherwise
+        """
+        similar_issue, score = self.find_similar_issue(summary, assignee_name)
+        
+        if similar_issue:
+            issue_key = similar_issue.get("key")
+            existing_summary = similar_issue.get("fields", {}).get("summary", "")
+            logger.info(f"Potential duplicate found: {issue_key} - '{existing_summary}' (similarity: {score:.0%})")
+            return issue_key
+        
+        return None
     
     @retry(
         stop=stop_after_attempt(3),
